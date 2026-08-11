@@ -1,5 +1,5 @@
 // Platform display helpers: mac keeps canonical notation; non-mac rewrites ⌘⇧ chords.
-import { describe, expect, it } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { hintLabel, isMacPlatform, keyLabel, modSymbol } from './platform-utils'
 
 describe('isMacPlatform', () => {
@@ -15,13 +15,30 @@ describe('isMacPlatform', () => {
 })
 
 describe('hintLabel', () => {
-  it('leaves the text untouched on mac', () => {
-    expect(hintLabel('⌘⇧Z', true)).toBe('⌘⇧Z')
+  it('passes mac strings through untouched', () => {
+    expect(hintLabel('Save (⌘S)', true)).toBe('Save (⌘S)')
+    expect(hintLabel('Redo (⌘⇧Z)', true)).toBe('Redo (⌘⇧Z)')
   })
 
-  it('rewrites chords for non-mac', () => {
-    expect(hintLabel('⌘⇧Z', false)).toBe('Ctrl+Shift+Z')
+  it('rewrites plain chords on non-mac', () => {
+    expect(hintLabel('Save (⌘S)', false)).toBe('Save (Ctrl+S)')
+    expect(hintLabel('⌘K', false)).toBe('Ctrl+K')
+    expect(hintLabel('Settings (⌘,)', false)).toBe('Settings (Ctrl+,)')
+    expect(hintLabel('⌘/', false)).toBe('Ctrl+/')
+  })
+
+  it('rewrites shift chords on non-mac', () => {
+    expect(hintLabel('Redo (⌘⇧Z)', false)).toBe('Redo (Ctrl+Shift+Z)')
+    expect(hintLabel('Explorer (⌘⇧E)', false)).toBe('Explorer (Ctrl+Shift+E)')
     expect(hintLabel('⌘P', false)).toBe('Ctrl+P')
+  })
+
+  it('keeps the return symbol and rewrites the modifier', () => {
+    expect(hintLabel('Message (⌘↵ to commit)', false)).toBe('Message (Ctrl+↵ to commit)')
+  })
+
+  it('handles a bare ⌘ with no trailing key', () => {
+    expect(hintLabel('no ⌘', false)).toBe('no Ctrl')
     expect(hintLabel('Esc ⌘', false)).toBe('Esc Ctrl')
   })
 })

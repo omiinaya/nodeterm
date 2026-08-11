@@ -1,24 +1,48 @@
-import { describe, it, expect, vi } from 'vitest'
-import type { NodeTerminalApi } from '@shared/types'
+// Claude /branch driver: sends the slash command, polls the buffer for the parked original
+// session id, and fails honestly when there is no tmux session or the id never appears.
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { branchClaudeSession } from './claudeBranch'
 
-const fakeApi = (over: { sendText?: unknown; capture?: unknown }): NodeTerminalApi =>
-  ({ pty: { sendText: over.sendText, capture: over.capture } }) as unknown as NodeTerminalApi
+const sendText = vi.fn()
+const capture = vi.fn()
+const api = { pty: { sendText, capture } } as never
+
+beforeEach(() => {
+  vi.clearAllMocks()
+})
 
 describe('branchClaudeSession', () => {
-  it('sends /branch through the passed api, not the global', async () => {
-    const sendText = vi.fn(async () => true)
-    const capture = vi.fn(async () => 'run claude -r abcdef12-3456 in a new terminal')
-    const res = await branchClaudeSession(fakeApi({ sendText, capture }), 'node-1')
-    expect(sendText).toHaveBeenCalledWith('node-1', '/branch')
-    expect(capture).toHaveBeenCalledWith('node-1')
-    expect(res).toEqual({ ok: true, originalId: 'abcdef12-3456' })
+  it('returns an error when sendText reports no persistent session', async () => {
+    sendText.mockResolvedValue(false)
+    const res = await branchClaudeSession(api, 'n1')
+    expect(res.ok).toBe(false)
+    expect(res.error).toContain('persistent')
   })
 
-  it('fails without polling when the session is not persistent (sendText false)', async () => {
-    const capture = vi.fn()
-    const res = await branchClaudeSession(fakeApi({ sendText: vi.fn(async () => false), capture }), 'node-1')
+  it('captures the parked original id from the /resume line', async () => {
+    sendText.mockResolvedValue(true)
+    capture.mockResolvedValue('...use /resume 12345678-aaaa to return...')
+    const res = await branchClaudeSession(api, 'n1')
+    expect(res).toEqual({ ok: true, originalId: '12345678-aaaa' })
+  })
+
+  it('captures the original id from the claude -r form', async () => {
+    sendText.mockResolvedValue(true)
+    capture.mockResolvedValue('run claude -r 9f8e7d6c5b4a in a new terminal')
+    const res = await branchClaudeSession(api, 'n1')
+    expect(res.ok).toBe(true)
+    expect(res.originalId).toBe('9f8e7d6c5b4a')
+  })
+
+  it('gives up after polling when the id never appears', async () => {
+    vi.useFakeTimers()
+    sendText.mockResolvedValue(true)
+    capture.mockResolvedValue('no branch output yet')
+    const p = branchClaudeSession(api, 'n1')
+    for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(300)
+    const res = await p
     expect(res.ok).toBe(false)
-    expect(capture).not.toHaveBeenCalled()
+    expect(res.error).toContain("Couldn't detect")
+    vi.useRealTimers()
   })
 })

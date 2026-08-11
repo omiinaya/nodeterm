@@ -1,37 +1,35 @@
-import { describe, it, expect } from 'vitest'
+// Download-route selection: which transport (if any) the Explorer offers per shell/project.
+import { describe, expect, it } from 'vitest'
 import { canRevealLocally, downloadRoute } from './download'
 
 describe('downloadRoute', () => {
-  it('pulls an SSH project over scp on the desktop', () => {
+  it('scp for desktop + SSH project (remote tree over the ControlMaster)', () => {
     expect(downloadRoute({ browser: false, ssh: true, source: 'local' })).toBe('scp')
   })
 
-  it('serves every browser tree over HTTP — including a "local" project, which is on the server', () => {
+  it('http for browser + local project (Server Edition one-shot ticket)', () => {
     expect(downloadRoute({ browser: true, ssh: false, source: 'local' })).toBe('http')
   })
 
-  it('offers nothing for a desktop local project (the file is already here)', () => {
+  it('none for desktop + local project (file already on this machine)', () => {
     expect(downloadRoute({ browser: false, ssh: false, source: 'local' })).toBe('none')
   })
 
-  it('offers nothing on a relay tab, whatever the project is', () => {
-    expect(downloadRoute({ browser: false, ssh: true, source: 'relay' })).toBe('none')
+  it('none for a relay tab (only the capped bridged fs.readBinary exists)', () => {
     expect(downloadRoute({ browser: true, ssh: false, source: 'relay' })).toBe('none')
+    expect(downloadRoute({ browser: false, ssh: true, source: 'relay' })).toBe('none')
   })
 
-  it('does not mint a ticket for an SSH tree in the browser (that fs is not the server’s)', () => {
+  it('none for browser + ssh (Server Edition has no SSH projects to serve)', () => {
     expect(downloadRoute({ browser: true, ssh: true, source: 'local' })).toBe('none')
   })
 })
 
 describe('canRevealLocally', () => {
-  it('is true only for a desktop local project', () => {
+  it('only for an Electron shell showing local paths', () => {
     expect(canRevealLocally({ browser: false, ssh: false, source: 'local' })).toBe(true)
-  })
-
-  it('is false where the path is not on this machine, or nothing can open it', () => {
-    expect(canRevealLocally({ browser: false, ssh: true, source: 'local' })).toBe(false)
     expect(canRevealLocally({ browser: true, ssh: false, source: 'local' })).toBe(false)
+    expect(canRevealLocally({ browser: false, ssh: true, source: 'local' })).toBe(false)
     expect(canRevealLocally({ browser: false, ssh: false, source: 'relay' })).toBe(false)
   })
 })

@@ -1,30 +1,57 @@
-import { describe, expect, it } from 'vitest'
-import { suppressMiddleClickPaste } from './middle-click'
+// @vitest-environment jsdom
+// Middle-click paste guard: pure suppression rule + the both-events capture wiring, and the
+// allow() read-at-event-time behavior.
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { guardMiddleClickPaste, suppressMiddleClickPaste } from './middle-click'
 
-/**
- * Issue #84: on Linux a middle click inside a terminal pasted the X PRIMARY selection into the pty,
- * with no way to switch it off — Chromium does it on the hidden textarea xterm keeps under the
- * cursor, and it honours the desktop's `gtk-enable-primary-paste` only in its own Views widgets.
- *
- * `guardMiddleClickPaste` itself needs a DOM and is verified on device; what is pinned here is the
- * DECISION, whose two halves are easy to invert — `allow` is the user's "middle click may paste",
- * so suppression is what happens when it is OFF.
- */
 describe('suppressMiddleClickPaste', () => {
-  it('suppresses the middle button while the setting is off', () => {
+  it('suppresses only middle button while allow is off', () => {
     expect(suppressMiddleClickPaste(1, false)).toBe(true)
-  })
-
-  it('lets the middle button through once the user opts in', () => {
     expect(suppressMiddleClickPaste(1, true)).toBe(false)
+    expect(suppressMiddleClickPaste(0, false)).toBe(false)
+    expect(suppressMiddleClickPaste(2, false)).toBe(false)
+  })
+})
+
+describe('guardMiddleClickPaste', () => {
+  let host: HTMLElement
+
+  afterEach(() => {
+    document.body.innerHTML = ''
   })
 
-  it('never touches the other buttons', () => {
-    // Left is selection and focus; right is the context menu. Preventing either default would
-    // break the terminal in a far more visible way than the bug being fixed.
-    for (const button of [0, 2, 3, 4]) {
-      expect(suppressMiddleClickPaste(button, false)).toBe(false)
-      expect(suppressMiddleClickPaste(button, true)).toBe(false)
-    }
+  it('prevents default on middle auxclick when allow is off, and reads allow at event time', () => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    let allow = false
+    guardMiddleClickPaste(host, () => allow)
+
+    // auxclick with allow off -> the cancelable event is default-prevented (dispatch returns false)
+    const blocked = new MouseEvent('auxclick', { button: 1, bubbles: true, cancelable: true })
+    expect(host.dispatchEvent(blocked)).toBe(false)
+
+    // flipping allow takes effect on the next click (read at event time)
+    allow = true
+    const passed = new MouseEvent('auxclick', { button: 1, bubbles: true, cancelable: true })
+    expect(host.dispatchEvent(passed)).toBe(true)
+  })
+
+  it('prevents default on middle mouseup too, but never on left button', () => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    guardMiddleClickPaste(host, () => false)
+    const mid = new MouseEvent('mouseup', { button: 1, bubbles: true, cancelable: true })
+    expect(host.dispatchEvent(mid)).toBe(false)
+    const left = new MouseEvent('mouseup', { button: 0, bubbles: true, cancelable: true })
+    expect(host.dispatchEvent(left)).toBe(true)
+  })
+
+  it('the returned cleanup removes both listeners', () => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    const unguard = guardMiddleClickPaste(host, () => false)
+    unguard()
+    const mid = new MouseEvent('mouseup', { button: 1, bubbles: true, cancelable: true })
+    expect(host.dispatchEvent(mid)).toBe(true) // no longer guarded
   })
 })

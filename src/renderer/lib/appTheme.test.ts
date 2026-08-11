@@ -1,21 +1,31 @@
-import { describe, it, expect } from 'vitest'
-import { resolveAppTheme, type AppThemePref } from './appTheme'
+// The app-chrome theme resolution and Monaco theme mapping — pure, table-testable.
+import { describe, expect, it } from 'vitest'
+import { monacoTheme, resolveAppTheme } from './appTheme'
 
 describe('resolveAppTheme', () => {
-  it('follows the terminal theme on auto', () => {
+  it('explicit light/dark short-circuit the terminal theme', () => {
+    expect(resolveAppTheme('light', false)).toBe('light')
+    expect(resolveAppTheme('dark', false)).toBe('dark')
+    expect(resolveAppTheme('light', true)).toBe('light')
+    expect(resolveAppTheme('dark', true)).toBe('dark')
+  })
+
+  it('auto follows the terminal theme', () => {
     expect(resolveAppTheme('auto', true)).toBe('dark')
     expect(resolveAppTheme('auto', false)).toBe('light')
   })
 
-  it('honours an explicit choice whatever the terminal theme is', () => {
-    expect(resolveAppTheme('dark', false)).toBe('dark')
-    expect(resolveAppTheme('light', true)).toBe('light')
+  it('defaults to dark for any unrecognised hand-edited value', () => {
+    // @ts-expect-error deliberate invalid hand-edited settings.json value
+    expect(resolveAppTheme('neon', false)).toBe('dark')
+    // undefined too (a settings.json key can be present-but-empty)
+    expect(resolveAppTheme(undefined as unknown as 'auto' | 'dark' | 'light', false)).toBe('dark')
   })
+})
 
-  // settings.json is hand-editable and travels between versions; dark is what every existing
-  // install renders, so an unreadable value must land there rather than flipping the app white.
-  it('falls back to dark for an unrecognised preference', () => {
-    expect(resolveAppTheme('sepia' as AppThemePref, true)).toBe('dark')
-    expect(resolveAppTheme(undefined as unknown as AppThemePref, false)).toBe('dark')
+describe('monacoTheme', () => {
+  it('maps light -> vs and dark -> vs-dark', () => {
+    expect(monacoTheme('light')).toBe('vs')
+    expect(monacoTheme('dark')).toBe('vs-dark')
   })
 })

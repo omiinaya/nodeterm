@@ -1195,6 +1195,9 @@ export interface Settings {
    *  Distinct from `snapToGrid` (drag-time snap) — turning this on arranges once; it does not
    *  constrain future drags. v1: arrange-all-on-enable only. */
   autoAlignGrid: boolean
+  /** While resizing a node, draw a guide + "N px" badge for the nearest
+   *  neighbor it can be resized to match (see lib/matchSizeGuides.ts). */
+  matchSizeGuides: boolean
   /** Default size (px) for NEW terminal/agent nodes on the canvas. Existing nodes keep
    *  whatever size they were saved with; other node kinds keep their own defaults. */
   defaultNodeWidth: number
@@ -1514,6 +1517,7 @@ export const DEFAULT_SETTINGS: Settings = {
   gridSize: 24,
   snapToGrid: false,
   autoAlignGrid: false,
+  matchSizeGuides: true,
   defaultNodeWidth: 640,
   defaultNodeHeight: 440,
   sidebarAutoCollapse: true,

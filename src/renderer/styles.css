@@ -38,6 +38,12 @@
   /* Accent as TEXT on a surface — lighter than the fill accent so it reads on a dark panel, and
      the light theme has to go the other way. Was `#6cb0ff`/`#a9c0ff` at ~14 hover/link sites. */
   --accent-text: #6cb0ff;
+  /* Match-size guide chrome (canvas/MatchSizeGuides.tsx): a magenta, deliberately
+     OUTSIDE the node palette (NODE_COLORS), so the guide can never be mistaken for
+     a node's own resize color — the design-tool convention (Figma, Inkscape) for
+     alignment guides. */
+  --match-guide: #ff4fa3;
+  --match-guide-text: #ffb3d6;
   /* Status hues, named so the light theme can darken them for a white field in one place. */
   --danger: #ff453a;
   --warn: #ff9f0a;
@@ -133,6 +139,8 @@
   --accent-hover: #0a6ed1;
   /* Accent as text has to DARKEN here, where the dark theme's lightened blue disappears. */
   --accent-text: #0060df;
+  --match-guide: #d81b60;
+  --match-guide-text: #8e0e43;
 
   /* The canvas sits BELOW every node, so it is the one surface that must be darker than the
      panels — otherwise the nodes dissolve into the field and the layout loses its edges. */
@@ -9878,5 +9886,30 @@ body,
 .theme-select__name {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Match-size guides (canvas/MatchSizeGuides.tsx): the target line and the
+   "N px to drag" badge shown while a node is resized near a size match.
+   Both live inside the React Flow viewport, so their transforms are flow
+   coordinates; the badge counter-scales itself via an inline 1/zoom transform. */
+.match-guide-line {
+  position: absolute;
+  pointer-events: none;
+  background: var(--match-guide);
+  opacity: 0.95;
+}
+.match-guide-badge {
+  position: absolute;
+  pointer-events: none;
+}
+.match-guide-badge span {
+  display: block;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--match-guide) 14%, transparent);
+  border: 1px solid var(--match-guide);
+  color: var(--match-guide-text);
+  font: 600 11px/1.4 -apple-system, BlinkMacSystemFont, sans-serif;
   white-space: nowrap;
 }

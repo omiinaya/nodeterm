@@ -787,6 +787,9 @@ export interface Settings {
   defaultShell: string
   gridSize: number
   snapToGrid: boolean
+  /** While resizing a node, draw a guide + "N px" badge for the nearest
+   *  neighbor it can be resized to match (see lib/matchSizeGuides.ts). */
+  matchSizeGuides: boolean
   /** Default size (px) for NEW terminal/agent nodes on the canvas. Existing nodes keep
    *  whatever size they were saved with; other node kinds keep their own defaults. */
   defaultNodeWidth: number
@@ -974,6 +977,7 @@ export const DEFAULT_SETTINGS: Settings = {
   defaultShell: '',
   gridSize: 24,
   snapToGrid: false,
+  matchSizeGuides: true,
   defaultNodeWidth: 640,
   defaultNodeHeight: 440,
   sidebarAutoCollapse: true,

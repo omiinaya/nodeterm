@@ -42,6 +42,7 @@ import {
   setSharedGlyphCamera,
   useSharedGlyphActive
 } from './SharedGlyphLayer'
+import { MatchSizeGuides } from './MatchSizeGuides'
 import { SshReconnector } from '../lib/sshReconnect'
 import { terminalKey } from '../terminal/terminal-config'
 import { setWebglGesture, setWebglZoom, WEBGL_GESTURE_SETTLE_MS } from '../terminal/webgl-budget'
@@ -8017,6 +8018,9 @@ export function Canvas() {
           {/* Peer cursors live INSIDE <ReactFlow>: PresenceLayer uses ViewportPortal +
               useReactFlow, which throw outside the provider — and cursors are flow coordinates. */}
           <PresenceLayer />
+          {/* The match-size guide also lives inside <ReactFlow> (see its module doc);
+              it renders null while nothing is being resized, or when the setting is off. */}
+          <MatchSizeGuides />
           <StatusAwareMiniMap onNodeDoubleClick={goToNode} />
         </ReactFlow>
         </SessionProvider>

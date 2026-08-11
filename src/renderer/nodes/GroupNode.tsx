@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { NodeResizer, useReactFlow, type NodeProps } from '@xyflow/react'
+import { useReactFlow, type NodeProps } from '@xyflow/react'
+import { MatchSizeNodeResizer } from '../canvas/MatchSizeNodeResizer'
 import { NODE_COLORS, ungroupNodes, type CanvasNode } from '../state/workspace'
 import { useProjects } from '../state/projects'
 import { useWorktrees, WORKTREE_STATUS_POLL_MS } from '../state/worktrees'
@@ -139,7 +140,7 @@ export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
         boxShadow: selected ? `0 0 0 1.5px ${data.color}` : undefined
       }}
     >
-      <NodeResizer
+      <MatchSizeNodeResizer
         minWidth={200}
         minHeight={140}
         isVisible={selected}

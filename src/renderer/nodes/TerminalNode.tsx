@@ -1,12 +1,12 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Handle,
-  NodeResizer,
   Position,
   useReactFlow,
   useUpdateNodeInternals,
   type NodeProps
 } from '@xyflow/react'
+import { MatchSizeNodeResizer } from '../canvas/MatchSizeNodeResizer'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { SearchAddon } from '@xterm/addon-search'
@@ -3090,7 +3090,7 @@ export function TerminalNode({
       onMouseEnter={() => (hoveredRef.current = true)}
       onMouseLeave={() => (hoveredRef.current = false)}
     >
-      <NodeResizer minWidth={260} minHeight={160} isVisible={selected && !collapsed} color="#0a84ff" />
+      <MatchSizeNodeResizer minWidth={260} minHeight={160} isVisible={selected && !collapsed} color="#0a84ff" />
       {/* Invisible source handle so edges to subagent/loop nodes can attach. */}
       <Handle
         id="flow-out"

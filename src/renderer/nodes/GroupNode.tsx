@@ -159,6 +159,7 @@ export function GroupNode({ id, data, selected }: NodeProps<CanvasNode>) {
         minWidth={NODE_MIN_SIZES.group.width}
         minHeight={NODE_MIN_SIZES.group.height}
       <MatchSizeNodeResizer
+        nodeId={id}
         isVisible={selected}
         color={data.color}
         lineStyle={{ borderColor: 'transparent' }}

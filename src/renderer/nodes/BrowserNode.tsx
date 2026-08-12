@@ -23,7 +23,7 @@ export default function BrowserNode({ id, data, selected }: NodeProps<CanvasNode
 
   return (
     <div className={`term-node browser-node${selected ? ' selected' : ''}`} style={{ borderTopColor: data.color }}>
-      <MatchSizeNodeResizer minWidth={NODE_MIN_SIZES.browser.width} minHeight={NODE_MIN_SIZES.browser.height} isVisible={selected} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.browser.width} minHeight={NODE_MIN_SIZES.browser.height} isVisible={selected} color={data.color} />
       {/* Invisible target handle so a rope from the agent node that opened this can attach. */}
       <Handle
         id="flow-in"

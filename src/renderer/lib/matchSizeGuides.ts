@@ -30,6 +30,8 @@ export interface ResizeGesture {
   rect: Rect
   /** The rectangle from the immediately previous resize frame (edge inference). */
   prevRect: Rect
+  /** The rectangle the drag STARTED from (axis-movement gate, see MOVEMENT_DEAD_ZONE_PX). */
+  startRect: Rect
 }
 
 /** The perpendicular edge of A that the user is dragging (per axis). */
@@ -64,6 +66,16 @@ export interface MatchNode {
 
 export const OVERLAP_MIN_PX = 40
 export const MATCH_LOOKAHEAD_PX = 240
+/**
+ * Movement dead-zone for treating an axis as "being resized". Measured against
+ * the rect the drag STARTED from, not the previous frame: a bottom-edge drag
+ * can carry ±1-2px of width noise per frame, and comparing prev-to-curr made
+ * that noise look like an active width resize — the width guide then won (or
+ * latched) and the height guide never appeared. An axis only counts as moving
+ * once it has really left the start rect by this many px, so a vertical drag
+ * with jittered width is a height drag, period.
+ */
+export const MOVEMENT_DEAD_ZONE_PX = 4
 /**
  * Hysteresis dead-zone for the shown target. A corner drag can straddle a width
  * match and a height match, and the cursor jitters by a few px per frame — with
@@ -174,10 +186,14 @@ export function pickMatchTarget(
   nodes: MatchNode[],
   current: CurrentMatch | null = null
 ): MatchTarget | null {
-  const { rect, prevRect, nodeId } = gesture
+  const { rect, prevRect, startRect, nodeId } = gesture
   const edges = movedEdges(prevRect, rect)
-  const widthMoved = rect.width !== prevRect.width
-  const heightMoved = rect.height !== prevRect.height
+  // An axis counts as "being resized" only when it has really moved away from
+  // the drag's start rect (see MOVEMENT_DEAD_ZONE_PX) — NOT when its prev-frame
+  // delta is non-zero, because ±1-2px of jitter on the perpendicular axis would
+  // otherwise make a bottom-edge drag look like a width drag too.
+  const widthMoved = Math.abs(rect.width - startRect.width) >= MOVEMENT_DEAD_ZONE_PX
+  const heightMoved = Math.abs(rect.height - startRect.height) >= MOVEMENT_DEAD_ZONE_PX
   const flat = !widthMoved && !heightMoved
   const axes: MatchAxis[] = []
   if (widthMoved || flat) axes.push('width')

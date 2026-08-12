@@ -13,7 +13,9 @@ import type { Rect, ResizeGesture } from '../lib/matchSizeGuides'
  * the stable action refs, so publishing never re-renders a node.
  *
  * `prevRect` is kept here so the pure pickMatchTarget() can tell which edge is
- * being dragged (left/top moved = that edge, otherwise right/bottom).
+ * being dragged (left/top moved = that edge, otherwise right/bottom), and
+ * `startRect` records where the drag began so the same pure function can gate
+ * axes by real movement (see MOVEMENT_DEAD_ZONE_PX in lib/matchSizeGuides).
  */
 interface ResizeGestureState {
   gesture: ResizeGesture | null
@@ -29,7 +31,7 @@ export const useResizeGesture = create<ResizeGestureState>((set, get) => ({
   gesture: null,
 
   begin(nodeId, rect) {
-    set({ gesture: { nodeId, rect, prevRect: rect } })
+    set({ gesture: { nodeId, rect, prevRect: rect, startRect: rect } })
   },
 
   update(rect) {

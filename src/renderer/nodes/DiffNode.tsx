@@ -138,7 +138,7 @@ export function DiffNode({ id, data, selected }: NodeProps<CanvasNode>) {
       className={`term-node editor-node${selected ? ' selected' : ''}`}
       style={{ borderTopColor: data.color }}
     >
-      <MatchSizeNodeResizer minWidth={NODE_MIN_SIZES.diff.width} minHeight={NODE_MIN_SIZES.diff.height} isVisible={selected} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.diff.width} minHeight={NODE_MIN_SIZES.diff.height} isVisible={selected} color={data.color} />
 
       <div className="term-node__header">
         <span className="term-node__title-text" title={`${rel} — ${commitOid ? commitOid.slice(0, 7) : staged ? 'staged' : 'working'}`}>

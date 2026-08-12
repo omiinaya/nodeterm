@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { Handle, Position, useReactFlow, type NodeProps } from '@xyflow/react'
 import { NODE_MIN_SIZES } from '../lib/nodeSizing'
 import { MatchSizeNodeResizer } from '../canvas/MatchSizeNodeResizer'
@@ -69,7 +70,7 @@ export function StickyNode({ id, data, selected }: NodeProps<CanvasNode>) {
       className={`sticky-node${selected ? ' selected' : ''}${collapsed ? ' collapsed' : ''}`}
       style={{ background: `${data.color}22`, borderColor: data.color }}
     >
-      <MatchSizeNodeResizer minWidth={NODE_MIN_SIZES.sticky.width} minHeight={NODE_MIN_SIZES.sticky.height} isVisible={selected && !collapsed} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.sticky.width} minHeight={NODE_MIN_SIZES.sticky.height} isVisible={selected && !collapsed} color={data.color} />
 
       {/* Note-link handles: drag to/from a terminal node to attach this note as context. */}
       <Handle

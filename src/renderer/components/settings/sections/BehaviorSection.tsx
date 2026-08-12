@@ -25,10 +25,10 @@ const ROWS = {
   autoAlign: {
     title: 'Snap to grid mode (auto-arrange)',
     keywords: ['snap', 'grid', 'align', 'arrange', 'auto', 'mode']
+  },
   matchSize: {
     title: 'Match-size guides',
     keywords: ['match', 'size', 'resize', 'guide', 'align', 'adjacent', 'neighbor', 'drag']
-
   },
   panHover: { title: 'Pan-hover delay (ms)', keywords: ['pan', 'hover', 'delay', 'focus', 'guard'] },
   doubleClick: { title: 'Double-click to focus', keywords: ['double', 'click', 'focus'] },
@@ -156,6 +156,10 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
               checked={settings.autoAlignGrid}
               onChange={(v) => update({ autoAlignGrid: v })}
               ariaLabel="Snap to grid mode"
+            />
+          }
+        />
+      </SearchableRow>
       <SearchableRow {...ROWS.matchSize}>
         <FieldRow
           label="Match-size guides"
@@ -165,7 +169,6 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
               checked={settings.matchSizeGuides}
               onChange={(v) => update({ matchSizeGuides: v })}
               ariaLabel="Match-size guides"
-
             />
           }
         />

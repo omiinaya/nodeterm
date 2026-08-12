@@ -108,7 +108,7 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
       className={`term-node web-node${selected ? ' selected' : ''}`}
       style={{ borderTopColor: data.color }}
     >
-      <MatchSizeNodeResizer minWidth={NODE_MIN_SIZES.web.width} minHeight={NODE_MIN_SIZES.web.height} isVisible={selected} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.web.width} minHeight={NODE_MIN_SIZES.web.height} isVisible={selected} color={data.color} />
       {/* Invisible target handle so a rope from the agent node that opened this can attach. */}
       <Handle
         id="flow-in"

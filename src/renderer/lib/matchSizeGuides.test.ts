@@ -10,8 +10,12 @@ import {
 
 const A = { id: 'a', x: 0, y: 0, width: 400, height: 200 }
 
-function gesture(rect: ResizeGesture['rect'], prevRect: ResizeGesture['prevRect'] = rect): ResizeGesture {
-  return { nodeId: 'a', rect, prevRect }
+function gesture(
+  rect: ResizeGesture['rect'],
+  prevRect: ResizeGesture['prevRect'] = rect,
+  startRect: ResizeGesture['startRect'] = prevRect
+): ResizeGesture {
+  return { nodeId: 'a', rect, prevRect, startRect }
 }
 
 describe('movedEdges', () => {
@@ -193,6 +197,42 @@ describe('pickMatchTarget — hysteresis (corner-drag anti-flicker)', () => {
     const cur = { x: 0, y: 0, width: 405, height: 215 }
     const prev = { x: 0, y: 0, width: 400, height: 200 }
     expect(pickMatchTarget(gesture(cur, prev), [A, bw, bh])?.axis).toBe('height')
+  })
+})
+
+describe('pickMatchTarget — movement dead-zone (jitter on the perpendicular axis)', () => {
+  // A bottom-edge drag must stay a HEIGHT drag even when width carries ±1-2px
+  // of per-frame noise AND a side-by-side width match exists — the vertical
+  // (height) guide has to appear, not be suppressed by the width noise.
+  const A = { id: 'a', x: 0, y: 0, width: 400, height: 200 }
+  const B: MatchNode = { id: 'b', x: 0, y: 300, width: 400, height: 150 } // below: height match
+  const C: MatchNode = { id: 'c', x: 500, y: 0, width: 390, height: 200 } // side: width match
+
+  it('vertical drag with ±1px width jitter stays a height match (does not flip to width)', () => {
+    const start = { x: 0, y: 0, width: 400, height: 200 }
+    const prev = { x: 0, y: 0, width: 399, height: 210 } // prev width jittered -1
+    const rect = { x: 0, y: 0, width: 401, height: 215 } // width jittered +1, height moved 15
+    const t = pickMatchTarget(gesture(rect, prev, start), [A, B, C])
+    expect(t?.axis).toBe('height')
+    expect(t?.targetNodeId).toBe('b')
+  })
+
+  it('horizontal drag with ±1px height jitter stays a width match (does not flip to height)', () => {
+    const start = { x: 0, y: 0, width: 400, height: 200 }
+    const prev = { x: 0, y: 0, width: 410, height: 199 }
+    const rect = { x: 0, y: 0, width: 415, height: 201 }
+    const t = pickMatchTarget(gesture(rect, prev, start), [A, B, C])
+    expect(t?.axis).toBe('width')
+    expect(t?.targetNodeId).toBe('c')
+  })
+
+  it('an axis that really moves from start is treated as active even with prev-frame jitter', () => {
+    // height moved 20 from start (well past the dead-zone), width jittered but < dead-zone
+    const start = { x: 0, y: 0, width: 400, height: 200 }
+    const prev = { x: 0, y: 0, width: 401, height: 219 }
+    const rect = { x: 0, y: 0, width: 399, height: 220 }
+    const t = pickMatchTarget(gesture(rect, prev, start), [A, B, C])
+    expect(t?.axis).toBe('height')
   })
 })
 

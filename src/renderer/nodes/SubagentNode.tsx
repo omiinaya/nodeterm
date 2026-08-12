@@ -61,7 +61,7 @@ export function SubagentNode({ id, data, selected }: NodeProps<CanvasNode>) {
 
   return (
     <div onPointerDownCapture={select} className={`subagent-node${working ? ' working' : ' done'}`}>
-      <MatchSizeNodeResizer isVisible={selected} minWidth={180} minHeight={84} color="#d97757" />
+      <MatchSizeNodeResizer nodeId={id} isVisible={selected} minWidth={180} minHeight={84} color="#d97757" />
       <Handle type="target" position={Position.Top} isConnectable={false} />
       <div className="subagent-node__head nodrag" onClick={toggle} style={{ cursor: 'pointer' }}>
         <button

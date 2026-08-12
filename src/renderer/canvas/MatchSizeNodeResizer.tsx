@@ -1,4 +1,4 @@
-import { NodeResizer, useNodeId, type NodeResizerProps } from '@xyflow/react'
+import { NodeResizer, type NodeResizerProps } from '@xyflow/react'
 import { useResizeGesture } from '../state/resizeGesture'
 
 /**
@@ -11,14 +11,13 @@ import { useResizeGesture } from '../state/resizeGesture'
  * never re-renders because of the gesture traffic — only the canvas-level
  * MatchSizeGuides overlay (which subscribes to `gesture`) does.
  *
- * nodeId comes from the same context NodeResizer itself uses, so this works
- * whether or not the caller passes an explicit `nodeId` prop. The gesture is
+ * nodeId comes from the explicit `nodeId` prop the node passes down (or ''
+ * when absent, in which case the gesture is tracked without an id). The gesture is
  * only active between onResizeStart and onResizeEnd; the guide vanishes the
  * instant the handle is released.
  */
-export function MatchSizeNodeResizer(props: NodeResizerProps): JSX.Element {
-  const contextNodeId = useNodeId()
-  const nodeId = props.nodeId ?? contextNodeId ?? ''
+export function MatchSizeNodeResizer(props: NodeResizerProps & { nodeId?: string }): JSX.Element {
+  const nodeId = props.nodeId ?? ''
   const begin = useResizeGesture((s) => s.begin)
   const update = useResizeGesture((s) => s.update)
   const end = useResizeGesture((s) => s.end)

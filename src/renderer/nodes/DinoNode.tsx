@@ -94,7 +94,7 @@ export function DinoNode({ id, data, selected }: NodeProps<CanvasNode>) {
 
   return (
     <div className={`dino-node${selected ? ' selected' : ''}`} style={{ borderColor: data.color }}>
-      <MatchSizeNodeResizer minWidth={NODE_MIN_SIZES.dino.width} minHeight={NODE_MIN_SIZES.dino.height} isVisible={selected} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.dino.width} minHeight={NODE_MIN_SIZES.dino.height} isVisible={selected} color={data.color} />
 
       <div className="dino-node__header" style={{ background: `${data.color}33` }}>
         <span className="term-node__color" style={{ background: data.color }} />

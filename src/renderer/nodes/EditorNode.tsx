@@ -262,7 +262,7 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
       onMouseEnter={() => (hoveredRef.current = true)}
       onMouseLeave={() => (hoveredRef.current = false)}
     >
-      <MatchSizeNodeResizer minWidth={NODE_MIN_SIZES.editor.width} minHeight={NODE_MIN_SIZES.editor.height} isVisible={selected} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.editor.width} minHeight={NODE_MIN_SIZES.editor.height} isVisible={selected} color={data.color} />
       {/* Invisible target handle so a rope from an agent node that opened this can attach. */}
       <Handle
         id="flow-in"

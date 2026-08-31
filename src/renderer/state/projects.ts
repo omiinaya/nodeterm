@@ -4,12 +4,18 @@ import type {
   BridgeLink,
   CanvasMutation,
   CanvasNodeState,
+  NavStop,
   Project,
   ProjectKanban,
   Viewport,
   Workspace
 } from '@shared/types'
+import { collisionSeed, derivedProjectId } from '@shared/project-id'
+import type { ProjectCapability } from '@shared/project-capabilities'
+import type { ProjectIcon } from '@shared/project-icon'
+import { recordCapabilityAck, type CapabilityAnswer } from '@shared/project-capability-consent'
 import { applyCanvasMutation, createProject, reorderGroupWithinParent } from './workspace'
+import { markWorkspaceDirty } from './workspaceDirty'
 
 interface ProjectsState {
   projects: Project[]
@@ -46,14 +52,18 @@ interface ProjectsState {
    *  a fresh empty project for a folder that already has one: its first mirror write used to
    *  clobber the server's .nodeterm/project.json. Activates and returns it. */
   openSshProject(label: string, ssh: NonNullable<Project['ssh']>): Project
-  /** Registers a probed project (from a folder's .nodeterm file). If the id collides with an
-   *  existing project, derives a fresh project id (node ids untouched). Activates it. */
+  /** Registers a probed project (from a folder's .nodeterm file). The probe already minted the id
+   *  — the shared file carries none — so this only defends against a collision with an existing
+   *  project (node ids untouched). Activates it. */
   adoptProject(project: Project): Project
   /** Replaces one project's data wholesale (external file change). Keeps activeProjectId. */
   replaceProject(project: Project): void
   renameProject(id: string, name: string): void
   /** Sets a project's sidebar/monogram accent color. No-op for an unknown id. */
   setProjectColor(id: string, color: string): void
+  /** Sets (or clears, with undefined = fall back to the color monogram) the project's icon. Stored
+   *  on `Project.icon` and git-shared via project.json like name/color. No-op for an unknown id. */
+  setProjectIcon(id: string, icon: ProjectIcon | undefined): void
   setProjectCwd(id: string, cwd: string): void
   /** Grey (or un-grey) a project tab as "unavailable" WITHOUT dropping it — runtime-only, never
    *  persisted (see the toWorkspace tripwire). Set true when a relay tab's socket drops (Stage 4
@@ -64,10 +74,27 @@ interface ProjectsState {
   /** Sets (or clears, with undefined = fall back to the global setting) the project's default
    *  permission mode for new Claude terminal (CLI) sessions. Chat nodes are not covered. */
   setProjectDefaultPermissionMode(id: string, mode: AgentPermissionMode | undefined): void
+  /**
+   * THE strict per-project capability setter (@shared/project-capabilities). `on` writes the
+   * literal `true` the validators accept AND records this machine's 'kept' answer — setting a
+   * switch yourself is its own consent, so the clone notice never fires on your own decision.
+   * `off` deletes the field outright (an off capability adds no bytes to the shared file) AND
+   * records 'declined': if a teammate's (or a hostile) `true` re-arrives via git, the capability
+   * is refused and re-noticed rather than silently re-granted (PR #213 C1/M-2). */
+  setProjectCapability(id: string, cap: ProjectCapability, on: boolean): void
+  /**
+   * Records this machine's ANSWER ('kept' | 'declined') to the one-time clone notice.
+   * MACHINE-LOCAL by construction: `Project.capabilityAck` rides `IndexEntryV3.capabilityAck`
+   * through splitWorkspace on the next save and is never written into .nodeterm/project.json
+   * (workspace-files.test.ts pins the file bytes; capability-notice.test.tsx pins this path). */
+  recordProjectCapabilityAck(id: string, cap: ProjectCapability, answer: CapabilityAnswer): void
   /** Raises the project's dino high score (never lowers it). */
   setDinoHighScore(id: string, score: number): void
   /** Replaces the project's kanban board (the UI computes the next board via lib/kanban). */
   setProjectKanban(id: string, kanban: ProjectKanban): void
+  /** Replaces the project's breadcrumb (navigation history) list wholesale — the UI computes the
+   *  next list via lib/breadcrumbs and hands it over whole, same convention as setProjectKanban. */
+  setProjectBreadcrumbs(id: string, breadcrumbs: NavStop[]): void
   /** Writes the serialized canvas (nodes + viewport + bridge links + control ropes) back into a project. */
   commitCanvas(
     id: string,
@@ -117,6 +144,30 @@ interface ProjectsState {
   closeProject(id: string): string
   /** Restores a closed project and makes it active. No-op if the id is unknown. */
   reopenProject(id: string): void
+
+  /**
+   * Registers (or finds) the project for a local directory WITHOUT activating it — the store half
+   * of the `open-project` control verb (issue #338, spec §2.1 steps 2–4). The human paths
+   * (`openFolderProject`/`adoptProject`/`reopenProject`) all set `activeProjectId`; an agent verb
+   * must not travel the user's view (spec P6), so this action NEVER writes it, in any branch.
+   *
+   * `resolvedCwd` is main's already-validated, `path.resolve`d form (spec P7) — this action only
+   * re-applies the trailing-slash normalization so the exact-string dedupe cannot be split by a
+   * cosmetic slash. Branches, in order:
+   *  - idempotent hit (B1): a project with this cwd is returned as-is; a `closed` one is
+   *    un-closed (its tab reappears) without activation. `name`/`color` are NOT applied — an
+   *    existing project's identity is never mutated on an agent's say-so.
+   *  - adopt: `probed` (the folder's own .nodeterm/project.json, from `probeFolder`) is added,
+   *    defending against an id collision exactly as `adoptProject` does (derived id, nodes kept).
+   *  - create: the same `createProject` factory `addProject` uses; `name` defaults to the folder
+   *    basename, `color` applies on create only.
+   */
+  registerProject(input: {
+    resolvedCwd: string
+    name?: string
+    color?: string
+    probed?: Project
+  }): { project: Project; created: boolean; adopted: boolean }
 
   toWorkspace(): Workspace
 }
@@ -178,6 +229,31 @@ function repositionState(
   }
 }
 
+/**
+ * Defense in depth for the ONE invariant this store cannot survive without: no two projects share
+ * an id. Every mutator here (`commitCanvas`, `deleteProject`, `closeProject`, `renameNode`, …)
+ * either maps by id — writing one canvas into BOTH projects — or filters by id, hitting both. The
+ * tab bar keys its children by id, which is how the bug announced itself: ~1500 React "two children
+ * with the same key" warnings.
+ *
+ * The store in main repairs the persisted index and re-keys the file (see
+ * `WorkspaceStore.repairDuplicateIds`); this is the renderer's own guard for anything that reaches
+ * hydrate some other way (a relay `projects.list` blob, a downgraded/older host). It uses the SAME
+ * derivation, so when both run they agree on the id rather than fighting over it.
+ */
+function withUniqueIds(projects: Project[]): Project[] {
+  const seen = new Set<string>()
+  return projects.map((p) => {
+    if (!seen.has(p.id)) {
+      seen.add(p.id)
+      return p
+    }
+    const id = derivedProjectId(p.id, collisionSeed(p), (c) => seen.has(c))
+    seen.add(id)
+    return { ...p, id }
+  })
+}
+
 /** Returns `projects` with one project's nodes transformed; other projects untouched. */
 function mapProjectNodes(
   projects: Project[],
@@ -193,7 +269,7 @@ export const useProjects = create<ProjectsState>((set, get) => ({
   reloadNonce: 0,
 
   hydrate(ws) {
-    set({ projects: ws.projects, activeProjectId: ws.activeProjectId })
+    set({ projects: withUniqueIds(ws.projects), activeProjectId: ws.activeProjectId })
   },
 
   requestReload() {
@@ -248,10 +324,17 @@ export const useProjects = create<ProjectsState>((set, get) => ({
 
   adoptProject(project) {
     const taken = get().projects.some((p) => p.id === project.id)
-    // A copied folder carries the original's project id; derive a fresh one. Node ids are
-    // deliberately kept (they are tmux session names — see the spec's accepted limitation).
+    // `probeFolder` mints the id (the folder's project.json no longer names one), so a collision
+    // here means the id was minted against a store this renderer had not hydrated yet — derive a
+    // fresh one. Node ids are deliberately kept (they are tmux session names — see the spec's
+    // accepted limitation). Deterministic in (id, folder), not random, so this path and the
+    // store's own repair never disagree about what a tab is called.
     const adopted = taken
-      ? { ...project, id: `${project.id}-${Math.random().toString(36).slice(2, 8)}` }
+      ? {
+          ...project,
+          id: derivedProjectId(project.id, collisionSeed(project), (c) =>
+            get().projects.some((p) => p.id === c))
+        }
       : project
     set((s) => ({ projects: [...s.projects, adopted], activeProjectId: adopted.id }))
     return adopted
@@ -272,6 +355,12 @@ export const useProjects = create<ProjectsState>((set, get) => ({
   setProjectColor(id, color) {
     set((s) => ({
       projects: s.projects.map((p) => (p.id === id ? { ...p, color } : p))
+    }))
+  },
+
+  setProjectIcon(id, icon) {
+    set((s) => ({
+      projects: s.projects.map((p) => (p.id === id ? { ...p, icon } : p))
     }))
   },
 
@@ -299,6 +388,33 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     }))
   },
 
+  setProjectCapability(id, cap, on) {
+    set((s) => ({
+      projects: s.projects.map((p) => {
+        if (p.id !== id) return p
+        if (on) return recordCapabilityAck({ ...p, [cap]: true }, cap, 'kept')
+        const next = { ...p }
+        delete next[cap]
+        // 'declined', not silence: the deletion lives only in this working copy, so a re-arriving
+        // `true` (teammate commit, git checkout) must re-notice instead of meeting a bare ack.
+        return recordCapabilityAck(next, cap, 'declined')
+      })
+    }))
+    // The setter owns the persist (issue #318): its call sites — the AgentsSection toggle, the
+    // clone notice's decline — schedule no save of their own, so without this the choice was lost
+    // on restart unless an unrelated canvas edit happened to dirty the workspace afterwards.
+    markWorkspaceDirty()
+  },
+
+  recordProjectCapabilityAck(id, cap, answer) {
+    set((s) => ({
+      projects: s.projects.map((p) => (p.id === id ? recordCapabilityAck(p, cap, answer) : p))
+    }))
+    // Same persistence gap as setProjectCapability: the notice's 'kept' answer rides
+    // IndexEntryV3.capabilityAck on the next save — which must actually be scheduled.
+    markWorkspaceDirty()
+  },
+
   setDinoHighScore(id, score) {
     // Raise-only: a stale/lower report (e.g. a second dino node) must never shrink the record.
     set((s) => ({
@@ -311,6 +427,12 @@ export const useProjects = create<ProjectsState>((set, get) => ({
   setProjectKanban(id, kanban) {
     set((s) => ({
       projects: s.projects.map((p) => (p.id === id ? { ...p, kanban } : p))
+    }))
+  },
+
+  setProjectBreadcrumbs(id, breadcrumbs) {
+    set((s) => ({
+      projects: s.projects.map((p) => (p.id === id ? { ...p, breadcrumbs } : p))
     }))
   },
 
@@ -475,6 +597,49 @@ export const useProjects = create<ProjectsState>((set, get) => ({
         activeProjectId: id
       }
     })
+  },
+
+  registerProject({ resolvedCwd, name, color, probed }) {
+    // The same exact-match rule as `openFolderProject` (a folder maps to one project), with the
+    // trailing slash stripped so `/a/b/` and `/a/b` cannot mint two tabs for one directory.
+    // Root stays '/': stripping it to '' would match every cwd-less project.
+    const cwd = resolvedCwd.length > 1 ? resolvedCwd.replace(/\/+$/, '') : resolvedCwd
+    const existing = get().projects.find((p) => p.cwd === cwd)
+    if (existing) {
+      if (existing.closed) {
+        // Un-close WITHOUT activation — reopenProject also activates, which is the exact
+        // mutation the register tests are checked against (spec P6).
+        set((s) => ({
+          projects: s.projects.map((p) => (p.id === existing.id ? { ...p, closed: false } : p))
+        }))
+      }
+      return {
+        project: get().projects.find((p) => p.id === existing.id) ?? existing,
+        created: false,
+        adopted: false
+      }
+    }
+    if (probed) {
+      // adoptProject's collision defense verbatim (deterministic in (id, folder)) — but appended
+      // WITHOUT the `activeProjectId` write that makes adoptProject a human path.
+      const taken = get().projects.some((p) => p.id === probed.id)
+      const adopted = taken
+        ? {
+            ...probed,
+            id: derivedProjectId(probed.id, collisionSeed(probed), (c) =>
+              get().projects.some((p) => p.id === c))
+          }
+        : probed
+      set((s) => ({ projects: [...s.projects, adopted] }))
+      return { project: adopted, created: false, adopted: true }
+    }
+    const fallbackName = cwd.split('/').filter(Boolean).pop() || 'Project'
+    const project = {
+      ...createProject(get().projects.length, name ?? fallbackName, cwd),
+      ...(color ? { color } : {})
+    }
+    set((s) => ({ projects: [...s.projects, project] }))
+    return { project, created: true, adopted: false }
   },
 
   toWorkspace() {

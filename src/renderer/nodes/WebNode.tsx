@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { Handle, NodeResizer, Position, useReactFlow, type NodeProps } from '@xyflow/react'
+import { Handle, Position, useReactFlow, type NodeProps } from '@xyflow/react'
+import { NODE_MIN_SIZES } from '../lib/nodeSizing'
+import { MatchSizeNodeResizer } from '../canvas/MatchSizeNodeResizer'
 import type { CanvasNode } from '../state/workspace'
 import { httpUrl } from './webUrl'
 import { useDiscardWhenHidden, webviewAudible, type AudibleWebview } from './useDiscardWhenHidden'
 import { DiscardedPlate } from './DiscardedPlate'
+import { useWebviewKeepAlive } from '../state/webviewKeepAlive'
 
 /**
  * A web view node. When `data.url` is set it loads that live URL; otherwise it serves the
@@ -84,6 +87,10 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
       setDiscarded(true)
       setSrc('')
       srcRef.current = ''
+      // A background keep-alive GHOST (data.ghost — lib/webviewKeepAlive.ts) whose guest is gone
+      // is a husk holding a pool slot: end its entry, which unmounts this whole node. An active
+      // node keeps the plate-and-restore behavior unchanged.
+      if (data.ghost === true) useWebviewKeepAlive.getState().drop(id)
     },
     onRestore: () => {
       setDiscarded(false)
@@ -101,7 +108,7 @@ export default function WebNode({ id, data, selected }: NodeProps<CanvasNode>) {
       className={`term-node web-node${selected ? ' selected' : ''}`}
       style={{ borderTopColor: data.color }}
     >
-      <NodeResizer minWidth={320} minHeight={200} isVisible={selected} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.web.width} minHeight={NODE_MIN_SIZES.web.height} isVisible={selected} color={data.color} />
       {/* Invisible target handle so a rope from the agent node that opened this can attach. */}
       <Handle
         id="flow-in"

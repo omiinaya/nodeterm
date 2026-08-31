@@ -107,6 +107,81 @@ export function getWebglBudget(): number {
 }
 
 /**
+ * THE CRISP GATE — above this canvas zoom the coordinator holds NO contexts, and every terminal
+ * paints through xterm's DOM renderer instead.
+ *
+ * A GPU terminal is a BITMAP: the addon rasterizes into a canvas sized from the element's LAYOUT
+ * box in device pixels, and React Flow's `transform: scale()` then magnifies that bitmap. xterm
+ * never learns about the zoom — its sizing observer reads `devicePixelContentBoxSize`, which
+ * ignores transforms — so zooming in makes GPU text softer and dimmer, while the DOM renderer's
+ * text is re-rastered by the browser at the composited scale and gets SHARPER. Measured on one
+ * node with identical content (share of ink pixels sitting mid-ramp between background and peak;
+ * higher = blurrier):
+ *
+ *              100%     200%    peak glyph luminance at 200%
+ *   webgl      55.7% →  62.7%   226 → 194
+ *   dom        60.3% →  36.8%   226 → 226
+ *
+ * Raising the terminal's effective device-pixel ratio with the zoom was tried first and does not
+ * work from outside the addon: three variants (dpr override; + pinning the backing store; +
+ * re-running the renderer resize) all left the terminal drawing almost nothing, because the
+ * renderer assumes throughout that its canvas is at true device resolution. Swapping renderers is
+ * what remains, and it is affordable exactly where it is needed: at this zoom only one or two
+ * terminals fit on screen, so the swap is a couple of nodes, not a canvas-wide rebalance.
+ *
+ * This is deliberately the INVERSE of the zoom gate removed in the budget-only lifecycle change,
+ * and it is not that gate returning: that one suspended the GPU when zoomed OUT past 40% on a
+ * compositor theory that was later refuted, and it cost half-second stalls on a band users cross
+ * constantly. This one triggers only when someone zooms IN past 175% — a deliberate "let me read
+ * this" gesture — and the release it performs is the cheap direction (teardown, no shader compile
+ * or atlas build).
+ */
+export const WEBGL_CRISP_ABOVE_ZOOM = 1.75
+/** Resume threshold, BELOW the crisp threshold on purpose (hysteresis): a pinch hovering at one
+ *  boundary must not thrash swap cycles — renderer churn is its own hazard. */
+export const WEBGL_GPU_RESUME_BELOW_ZOOM = 1.6
+
+/** True while the canvas is zoomed past the crisp threshold — grants are blocked. */
+let zoomCrisp = false
+
+/**
+ * Report the canvas zoom (React Flow viewport scale). Cheap and idempotent — call it from the
+ * zoom/pan handler; state only changes when a hysteresis boundary is crossed. Crossing UP marks
+ * every held context release-OWED and drains; crossing DOWN forgives owed releases still held
+ * (kept warm through a brief overshoot) and queues budget-gated grants for visible clients. Both
+ * directions go through `owed`/`drain`, so nothing swaps mid-gesture and a multi-node crossing
+ * trickles.
+ */
+export function setWebglZoom(zoom: number): void {
+  if (!Number.isFinite(zoom)) return
+  const next = zoomCrisp ? zoom > WEBGL_GPU_RESUME_BELOW_ZOOM : zoom > WEBGL_CRISP_ABOVE_ZOOM
+  if (next === zoomCrisp) return
+  zoomCrisp = next
+  if (zoomCrisp) {
+    for (const c of clients.values()) {
+      cancelAcquire(c)
+      if (c.granted) {
+        c.releaseOwed = true
+        owed.add(c)
+      }
+    }
+    drain()
+    return
+  }
+  if (!enabled) return
+  for (const c of clients.values()) {
+    // Zoomed back in under the threshold before the drain got to this client: keep the context,
+    // releasing and re-granting it back to back is the churn this design forbids.
+    if (c.granted && c.releaseOwed) c.releaseOwed = false
+    if (c.visible && !c.granted) {
+      c.releaseOwed = false
+      owed.add(c)
+    }
+  }
+  drain()
+}
+
+/**
  * THE GESTURE LATCH — the load-bearing rule of this coordinator: renderer swaps NEVER run
  * while the user is panning/zooming.
  *
@@ -145,11 +220,18 @@ export function setWebglGesture(active: boolean): void {
 
 /** Execute deferred swaps, a few per tick, self-rescheduling while work remains. */
 function drain(): void {
-  if (drainTimer) {
-    clearTimeout(drainTimer)
-    drainTimer = null
+  if (gestureActive) {
+    if (drainTimer) {
+      clearTimeout(drainTimer)
+      drainTimer = null
+    }
+    return
   }
-  if (gestureActive) return
+  // A cycle is already running: new work joins the queue and rides its next tick. Without this
+  // the per-tick budget would really be per-CALLER, and the burst that matters arrives one
+  // client at a time — a GPU process reset gives every client its own retry timer, so each
+  // would otherwise find an idle drain and spend the whole budget on itself.
+  if (drainTimer) return
   let ops = 0
   for (const c of Array.from(owed)) {
     if (ops >= WEBGL_SWAPS_PER_DRAIN) break
@@ -159,7 +241,7 @@ function drain(): void {
       c.releaseOwed = false
       // Only release if the reason still holds — a client that came back (visible again, zoom
       // resumed) keeps its warm context instead of paying a release+re-grant round trip.
-      if (c.granted && (!c.visible || !enabled)) {
+      if (c.granted && (zoomCrisp || !c.visible || !enabled)) {
         reclaim(c)
         ops++
       }
@@ -170,7 +252,13 @@ function drain(): void {
       if (c.granted) ops++
     }
   }
-  if (owed.size && !drainTimer) drainTimer = setTimeout(drain, WEBGL_DRAIN_MS)
+  // Armed UNCONDITIONALLY — even on an empty queue — because it is what rate-limits the next
+  // CALLER (see above). The tick clears the handle first (it is itself a drain() call and the
+  // guard above would stop it) and only re-runs when work remains.
+  drainTimer = setTimeout(() => {
+    drainTimer = null
+    if (owed.size) drain()
+  }, WEBGL_DRAIN_MS)
 }
 
 /**
@@ -342,6 +430,8 @@ function tryGrant(c: Client): void {
   if (!clients.has(c.id) || !c.visible || c.granted) return
   // Master switch off → never grant; every terminal stays on the DOM renderer.
   if (!enabled) return
+  // Zoomed in past the crisp threshold → never grant (see setWebglZoom).
+  if (zoomCrisp) return
   // Mid-gesture → park the attempt; the rest-time drain re-runs it (see the gesture latch).
   if (gestureActive) {
     c.releaseOwed = false
@@ -442,7 +532,14 @@ export function registerWebglClient(id: string, callbacks: WebglClientCallbacks)
       if (c.visible && c.lossStreak <= WEBGL_LOSS_STREAK_MAX && !c.acquireTimer) {
         c.acquireTimer = setTimeout(() => {
           c.acquireTimer = null
-          tryGrant(c)
+          // QUEUED, not granted inline: a GPU process reset loses every context on the page at
+          // once, so every visible client schedules this retry and they all come due together —
+          // a dozen renderer rebuilds in one frame, which is the swap burst the drain exists to
+          // spread out (and it parks the work while a gesture runs). A lone client is
+          // unaffected: the drain executes an idle queue immediately.
+          c.releaseOwed = false
+          owed.add(c)
+          drain()
         }, WEBGL_REACQUIRE_AFTER_LOSS_MS)
       }
     },
@@ -471,6 +568,7 @@ export function __resetWebglBudgetForTests(): void {
   visibilityClock = 0
   budget = WEBGL_BUDGET
   enabled = true
+  zoomCrisp = false
   gestureActive = false
   owed.clear()
   if (drainTimer) {

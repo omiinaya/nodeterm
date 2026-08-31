@@ -13,6 +13,7 @@ import {
   type PaneCursor,
   type PtyCreateOptions,
   type PtyCreateResult,
+  type PtyRecycleTarget,
   type Settings,
   type TmuxStatus
 } from '../shared/types'
@@ -26,12 +27,25 @@ import {
   localKillSockets,
   localTmuxKillArgs,
   remoteTmuxPtyArgs,
-  remoteTmuxSendKeysArgs,
+  type RemoteSessionEnv,
+  remotePasteDelivery,
   remoteCapturePaneArgs,
   remotePaneCommandArgs,
+  remotePaneOwnerCombinedArgs,
+  remotePaneProcessArgs,
+  remoteTerminateForegroundArgs,
   remotePaneCursorArgs
 } from './remote-ssh/control-master'
+import { probeAgentSockToPin } from './remote-ssh/agent-probe'
 import { parsePaneCursor } from './pane-cursor'
+import { classifyPaneCwd } from './pane-cwd'
+import {
+  recordFreshSpawnOwner,
+  forgetPaneOwner,
+  shouldRecordOwnership
+} from './agents/pane-ownership'
+import { PANE_OWNER_FMT, foregroundArgvArgs, paneOwnerFrom, parseCombinedPaneOwner, parsePaneOwner } from './agents/pane-owner'
+import { binariesFor, isAgentPane, type PaneOwner } from '../shared/agents/pane-owner-predicate'
 import { readSpawnResources, spawnResourceNote } from './spawn-resources'
 import {
   primePtyCeiling,
@@ -42,23 +56,78 @@ import {
 } from './pty-devices'
 import { REAP_SWEEP_MS, shouldReap } from './pty-reap'
 import { ControlModeClient, type ControlSpawn } from './tmux-control-client'
-import { TMUX_SOCKET, sessionName, isSessionName } from './tmux-naming'
+import {
+  TMUX_SOCKET,
+  sessionName,
+  isSessionName,
+  localPasteDelivery,
+  runPasteDelivery
+} from './tmux-naming'
 import { encodeSendKeysHex } from './tmux-control'
-import { bracketedInjection } from './paste-injection'
 import { releasePty, type ReleasablePty } from './pty-release'
+import { terminateWindowsProcessTree } from '../session-host/windows-process-tree'
 import { effectiveSize, type PtySize } from './pty-size'
 import { machOArch, archMismatch } from './macho-arch'
 import { writeScrollback, readScrollback, deleteScrollback } from './scrollback-store'
 import { claudeConfigDirFor } from './claude-config-dir'
 import { findExecutableSync, findInPathString, resolveShellPath, shellPathNow } from './exec-path'
-import { AUTH_ENV_STRIP, accountTmuxEnvArgs, remoteAccountConfigDirAbs } from './claude-accounts-core'
+import {
+  AUTH_ENV_STRIP,
+  accountTmuxEnvArgs,
+  isReservedSpawnEnvKey,
+  remoteAccountConfigDirAbs
+} from './claude-accounts-core'
+import {
+  AUTH_ENV_STRIP as CODEX_AUTH_ENV_STRIP,
+  codexSessionEnv,
+  isCodexScopeRefusal,
+  needsCodexAccountScope,
+  resolveCodexSessionScope
+} from './codex-accounts-core'
+import { NODE_ID_MAX, isSafeNodeId } from './remote-safety'
 import { presenceHub } from './presence/hub'
 import {
   codexLauncherDir,
   forgetCodexThreadIdentitiesForNode,
   installCodexLauncher
 } from './codex-identity-proxy'
-import { hasSharedIdentity, type AgentId } from '../shared/agents/config'
+import { ensureNodeToken, ensureRemoteNodeToken, sweepNodeToken } from './agents/node-token-service'
+import { clearNode as clearNodeAgentStatus } from './agent-status-mirror'
+import { hasSharedIdentity, setCustomAgentBaseResolver, type AgentId } from '../shared/agents/config'
+import { findCustomAgent } from '../shared/agents/custom-agent'
+import { applyCustomAgentEnv, customAgentEnvArgs } from './custom-agent-env'
+import {
+  MODEL_GATEWAY_ENV_KEYS,
+  modelGatewayEnv,
+  tmuxUpdateEnvironmentLine
+} from '../shared/agents/model-gateway'
+import { leadPaneHookLines } from '../shared/tmux-lead-pane'
+import {
+  remoteSessionEnvAvailable,
+  remoteSessionEnvPath,
+  sessionEnvFileContent,
+  stageRemoteSessionEnv
+} from './remote-ssh/session-env'
+import { foregroundProcessGroup, parsePaneProcess } from './pane-process'
+import { isShellCommand } from '../shared/agents/pane'
+// Third persistence backend, selected when no local tmux was found (primarily Windows, where
+// tmux does not exist at all) — see docs/windows-session-host.md. Deliberately a thin, separate
+// module rather than inline here: this is the one narrow seam this file needed to grow for a
+// whole standalone process + protocol living under src/session-host/.
+import {
+  attachExistingSessionHostPty,
+  createSessionHostPty,
+  sessionHostCapture,
+  sessionHostHasSession,
+  sessionHostKillSession,
+  sessionHostListSessions,
+  sessionHostPaneCommand,
+  sessionHostSendKeys,
+  sessionHostSupported,
+  SessionHostProtocolCompatibilityError
+} from './session-host-backend'
+import type { SessionHostPty } from './session-host-pty'
+import type { ProjectSpawnOverrides, ProjectSpawnOverridesReader } from './project-spawn-overrides'
 
 // How often we snapshot a live tmux session's scrollback to disk, so a machine reboot (which
 // kills the tmux server) can still replay recent output on cold restart. A final snapshot also
@@ -92,6 +161,17 @@ const execFileAsync = promisify(execFile)
 const PROC_TIMEOUT_MS = 15_000
 
 /**
+ * How long a spawn may wait on the project's settings before it goes ahead WITHOUT them.
+ *
+ * The reader is cheap on the local leg (an in-process store read), but the SSH leg's
+ * `readProjectSettings` reconciles the host's `settings.json` over the ControlMaster — the same
+ * half-dead-socket hazard that wedged `pty:create` once already (see PROC_TIMEOUT_MS). A terminal
+ * must never hang on a settings read, and the failure direction is the same one everything else
+ * here takes: no overrides, spawn anyway.
+ */
+const PROJECT_OVERRIDES_TIMEOUT_MS = 2_000
+
+/**
  * Shorter for the probes an interactive spawn WAITS ON. `hasRemoteSession` only decides warm vs
  * cold attach, and its timeout already degrades to the safe answer ("cannot probe" is not evidence
  * of absence — see `probeSaysAbsent`), so a long stall buys nothing and costs the user a terminal
@@ -109,6 +189,41 @@ const runAsync = ((file: string, args: readonly string[], opts?: object) =>
     timeout: PROC_TIMEOUT_MS,
     ...(opts ?? {})
   } as never)) as unknown as typeof execFileAsync
+
+/** Narrow child-process seam for strict tmux probes/confirmed teardown. Production delegates to
+ * the same bounded runner above; focused tests inject a stateful fake so hidden dual-backend
+ * generations can be proven ended without source-scanning or platform-specific helper scripts. */
+type ConfirmedProcessRun = (
+  file: string,
+  args: readonly string[],
+  opts?: object
+) => Promise<unknown>
+
+/**
+ * `runAsync`, with a payload written to the child's STDIN.
+ *
+ * The delivery path (`sendText`) puts the text in `tmux load-buffer -`'s stdin rather than in an
+ * argument — no payload on a command line, and no MAX_ARG_STRLEN ceiling (measured: 300 KB in one
+ * argument is "Argument list too long"; the same over stdin lands intact).
+ *
+ * `execFile`'s promise carries the ChildProcess as `.child`, so this stays inside the one bounded
+ * wrapper every other side-call uses instead of hand-rolling a spawn: same `PROC_TIMEOUT_MS`, same
+ * rejection on a non-zero exit. An EPIPE on the write (the child died before reading) is swallowed
+ * here on purpose — the process result is the authority, and an unhandled 'error' on the stream
+ * would take the main process down instead of failing this one call.
+ */
+function runWithStdin(file: string, args: readonly string[], input: string): Promise<unknown> {
+  const p = execFileAsync(file, args as string[], { timeout: PROC_TIMEOUT_MS } as never)
+  const child = (p as unknown as { child: import('child_process').ChildProcess }).child
+  const stdin = child.stdin
+  if (stdin) {
+    stdin.on('error', () => {
+      /* child gone; the exit code below is what decides success */
+    })
+    stdin.end(input)
+  }
+  return p as unknown as Promise<unknown>
+}
 
 // Minimal tmux config so the user's ~/.tmux.conf never interferes. The tmux server
 // (under our socket) keeps sessions alive while no client is attached, which is what
@@ -131,7 +246,33 @@ const runAsync = ((file: string, args: readonly string[], opts?: object) =>
 // payload with `terminal-features`). The renderer's OSC 52 handler writes the system clipboard, so
 // this is the copy path on EVERY platform and over SSH — no `pbcopy` pipe (that was macOS-only,
 // and half of why copying was broken).
-export function tmuxConf(scrollback: number): string {
+/**
+ * Session-identity env names the LOCAL conf's `update-environment` carries on top of the stock +
+ * gateway list (issue #419). The point is the REMOVAL half of update-environment's contract: the
+ * shared tmux server inherits the env of whichever client STARTS it, so a server started by a
+ * managed-account node's client held that account's `CLAUDE_CONFIG_DIR` in its GLOBAL env — and
+ * every later session created withOUT a `-e` override (system-account nodes, plain terminals, and
+ * the missing-dir fallback) inherited it and silently ran as that account ("the system account is
+ * entangled with the next account in the list"). With the names listed, tmux copies each one from
+ * the creating CLIENT's env — set for the node that owns it, and STRIPPED from the session when
+ * the client lacks it (measured in session-env.realtmux.test.ts, seeded-server case included).
+ * The auth-strip names ride along for the same reason: deleting them from the client env alone
+ * never touched a seeded server's global copy, so a managed-OAuth node could still run on an
+ * inherited API key. LOCAL conf only — see `tmuxUpdateEnvironmentLine` for why the remote conf
+ * must not get these.
+ */
+export const ACCOUNT_SCOPE_UPDATE_ENV: readonly string[] = [
+  'CLAUDE_CONFIG_DIR',
+  ...AUTH_ENV_STRIP,
+  'CODEX_HOME',
+  'NODETERM_CODEX_ACCOUNT_ID',
+  ...CODEX_AUTH_ENV_STRIP
+]
+
+// LEAD-PANE WIDTH (issue #119): `leadPaneWidth` (settings.tmuxLeadPaneWidth) is OPT-IN and 0 by
+// default — `leadPaneHookLines` returns '' then, so the default conf is byte-identical to the
+// pre-feature output (pinned in tmux-conf.test.ts). See shared/tmux-lead-pane.ts for the story.
+export function tmuxConf(scrollback: number, leadPaneWidth: number = 0): string {
   return `# auto-generated by node-terminal — do not edit
 set -g status off
 set -g mouse on
@@ -140,6 +281,14 @@ set -g default-terminal "xterm-256color"
 set -sg escape-time 10
 set -g destroy-unattached off
 setw -g aggressive-resize on
+# Credentials travel HERE, not on argv: gateway env vars ride the tmux client's process
+# environment and update-environment copies them into the session at create/attach. The old
+# '-e KEY=VALUE' route parked the API key on the long-lived attached client's command line —
+# world-readable in /proc/<pid>/cmdline on any multi-user host (the PR #195 leak class).
+# The account-scope names (CLAUDE_CONFIG_DIR et al.) are listed for their REMOVAL semantics:
+# a client that lacks one strips it from the session, so a server whose global env was seeded
+# by a managed-account client can no longer leak that account into unbound sessions (#419).
+${tmuxUpdateEnvironmentLine(ACCOUNT_SCOPE_UPDATE_ENV)}
 # Copy to the SYSTEM clipboard via OSC 52 (the client's terminal writes it). BOTH lines are needed
 # on tmux 3.2+ — see tmuxConf's doc comment before touching either.
 # MIGRATION — do not remove. Older versions of this file blanked smcup/rmcup/indn via
@@ -151,6 +300,12 @@ set -su terminal-overrides
 set -su terminal-features
 set -g set-clipboard on
 set -as terminal-features ",*:clipboard"
+# Truecolor passthrough: tmux clamps 24-bit SGR to the 256 palette unless the OUTER terminal is
+# known to speak RGB. xterm.js does, so declare it — via terminal-features like the clipboard
+# entry above, never terminal-overrides (see the MIGRATION note). Issue #78.
+set -as terminal-features ",*:RGB"
+# OSC 8 hyperlink passthrough — tmux strips the escape unless the outer terminal declares it.
+set -as terminal-features ",*:hyperlinks"
 # Mouse copy: on release tmux copies to its buffer AND (thanks to the two lines above) emits OSC 52,
 # which the client writes to the system clipboard. No pipe-to-a-local-command here, deliberately.
 bind -T copy-mode    MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel
@@ -159,7 +314,7 @@ bind -T copy-mode    DoubleClick1Pane send-keys -X select-word \\; send-keys -X 
 bind -T copy-mode-vi DoubleClick1Pane send-keys -X select-word \\; send-keys -X copy-pipe-and-cancel
 bind -T copy-mode    TripleClick1Pane send-keys -X select-line \\; send-keys -X copy-pipe-and-cancel
 bind -T copy-mode-vi TripleClick1Pane send-keys -X select-line \\; send-keys -X copy-pipe-and-cancel
-`
+${leadPaneHookLines(leadPaneWidth)}`
 }
 
 /**
@@ -187,6 +342,16 @@ bind -T copy-mode-vi TripleClick1Pane send-keys -X select-line \\; send-keys -X 
  * through the now-resolved tmux.
  */
 function findTmux(resourcesPath?: string): string | null {
+  // Windows has none of `tmuxCandidatePaths`' targets (Homebrew, MacPorts, Nix, the distro
+  // `/usr/bin` family — all POSIX filesystem layouts) and no bundled tmux (macOS-only, see
+  // `bundledTmuxPath`'s doc comment; `scripts/build-tmux.mjs` never runs for a Windows package).
+  // Walking either list would just be `existsSync` calls against paths that can never resolve on
+  // this platform — skip straight to the PATH probe, the one route that can find a real tmux a
+  // Windows user installed themselves (WSL's own tmux is a different filesystem entirely and is
+  // never on the Windows PATH; MSYS2/Cygwin tmux, if the user put it there, is).
+  if (os.platform() === 'win32') {
+    return findInPathString('tmux', shellPathNow() ?? process.env.PATH)
+  }
   // BOTH lookups inside the guard: `os.homedir()` throws the same SystemError as `userInfo()` when
   // there is no passwd entry and no $HOME (some containers), and a thrown probe here would take
   // out tmux discovery entirely — degrading a machine that HAS tmux to the plain-shell fallback,
@@ -262,6 +427,60 @@ function findSsh(): string | null {
 // resolveShellPath (the one async login-shell PATH probe) lives in exec-path.ts now, shared by
 // every module that used to spawn its own sync login shell. Prewarmed from init(); create()
 // awaits it, so terminals still always get the real PATH.
+
+/** Windows PowerShell always ships at this exact path (part of the OS since Vista) — the one
+ *  fallback that is always available, even when the PATH probe misses it. */
+const WIN_POWERSHELL_FALLBACK = (): string =>
+  `${process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
+
+/** PowerShell 7+'s default per-machine install location — a fallback for the case where the
+ *  installer's PATH update hasn't reached this (GUI-launched) process's inherited environment. */
+const WIN_PWSH_FALLBACK = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+
+/**
+ * The Windows session program when nothing else picked one (no explicit program, no
+ * `settings.defaultShell`): prefer PowerShell 7+ (`pwsh.exe` — the shell most developers actually
+ * want once they've installed it), then the Windows PowerShell every machine ships
+ * (`powershell.exe`), then whatever the environment itself calls its command processor
+ * (`COMSPEC` — normally `cmd.exe`, but respecting it rather than hardcoding keeps this correct on
+ * an environment that deliberately points it elsewhere), and only then a bare `cmd.exe` — the one
+ * binary guaranteed to exist on every Windows install, so this function can never return nothing.
+ */
+function resolveWindowsShell(): string {
+  const pathStr = shellPathNow() ?? process.env.PATH
+  const pwsh = findInPathString('pwsh', pathStr) ?? (fs.existsSync(WIN_PWSH_FALLBACK) ? WIN_PWSH_FALLBACK : null)
+  if (pwsh) return pwsh
+  const winPsFallback = WIN_POWERSHELL_FALLBACK()
+  const powershell = findInPathString('powershell', pathStr) ?? (fs.existsSync(winPsFallback) ? winPsFallback : null)
+  if (powershell) return powershell
+  return process.env.COMSPEC || 'cmd.exe'
+}
+
+/**
+ * One legacy local-shell resolver for BOTH direct node-pty and the persistent session-host
+ * backend. Windows desktop profile launches bypass this helper with a trusted resolved plan, but
+ * Server Edition and older callers without the optional profile service keep the same fallback.
+ * Keeping the fallback here prevents the two paths from drifting: the session host previously
+ * hardcoded `bash` even on Windows, while the direct path already knew how to find PowerShell or
+ * COMSPEC. Injectable platform leaves make that compatibility behavior testable on every CI host.
+ */
+export function resolveLocalSessionShell(
+  program: string | undefined,
+  defaultShell: string | undefined,
+  deps: {
+    platform?: NodeJS.Platform
+    windowsShell?: () => string
+    posixShell?: string
+  } = {}
+): string {
+  if (program) return program
+  if (defaultShell) return defaultShell
+  if ((deps.platform ?? os.platform()) === 'win32') {
+    return (deps.windowsShell ?? resolveWindowsShell)()
+  }
+  const posixShell = deps.posixShell !== undefined ? deps.posixShell : process.env.SHELL
+  return posixShell || 'bash'
+}
 
 /**
  * A UTF-8 locale for spawned terminals, or null to leave the inherited locale untouched.
@@ -446,6 +665,16 @@ interface Session {
   /** True when this node had an `accountId` but its config dir was gone at spawn, so we fell back
    *  to the system account. `create()` surfaces it to the renderer (warning chip). */
   accountFallback?: boolean
+  /**
+   * This session is backed by the session-host process (docs/windows-session-host.md), not a
+   * local tmux — selected only when no local tmux was found (primarily Windows). `session.proc`
+   * is then a `SessionHostPty`, not a real node-pty `IPty` (see `createSessionHostPty`). Every
+   * call site that reaches past `session.proc` to run a tmux CLI command directly (`sendText`,
+   * `paneCommand`, `captureSession`, `captureSnapshot`, `snapshotScrollback`,
+   * `captureForResync`, the final kill in `destroySession`) branches on this the same way it
+   * already branches on `sshRemote`.
+   */
+  sessionHost?: boolean
 }
 
 /** Sinks for a detached session whose output is served somewhere other than the renderer
@@ -483,6 +712,13 @@ const MAX_BUF_BYTES = 256 * 1024
  * still holding a dead pty, and being released late beats being frozen forever.
  */
 const RECYCLE_NOTIFY_TIMEOUT_MS = 10_000
+
+/** A non-Windows plain PTY has no taskkill-style process-absence proof, so confirmed recycle waits
+ * for this exact generation's exit event. Bound that wait: a broken native binding must reject the
+ * restart rather than leave its awaited IPC (and the renderer's destructive-action UI) hanging
+ * forever. Windows uses `terminateWindowsProcessTree` as the stronger absence proof when a valid
+ * PID is available. */
+export const CONFIRMED_PLAIN_EXIT_TIMEOUT_MS = 5_000
 
 /** Why a session is being ended — the ONE thing `destroySession` could not tell apart. Both kill
  *  the tmux session; they differ entirely in what the OTHER viewers are told.
@@ -566,13 +802,60 @@ export class PtyManager {
    *  ACROSS the awaits inside a spawn (see create()), not just after them. Entries are removed
    *  as soon as the spawn settles, success or failure. */
   private inflight = new Map<string, Promise<PtyCreateResult>>()
+  /** sessionId → exact generation whose persistent backend is being ended by the awaited profile
+   * switch path. A backend can emit exit before its kill response arrives; callbacks for this
+   * generation are deferred so no local state changes before acknowledgement. */
+  private confirmedBackendEnds = new Map<
+    string,
+    { session: Session; exitCode?: number; resolveExit?: () => void }
+  >()
+  /** One awaited profile-switch teardown per node. Without this guard two invocations can both
+   * install an exit barrier for the same generation and the second can report success after the
+   * first already removed the backend. */
+  private confirmedRecycles = new Map<string, Promise<void>>()
+  /** One in-flight end per node. Creates wait behind this barrier so a session-host exit that
+   *  arrives before its kill response cannot be mistaken for permission to respawn the node. */
+  private ending = new Map<
+    string,
+    {
+      intent: EndIntent
+      everySocket: boolean
+      backendAlreadyEnded: boolean
+      replacementTarget: PtyRecycleTarget | undefined
+      promise: Promise<void>
+    }
+  >()
+  /** A session-host kill request failed after dispatch, so absence is not proven. Keep creates
+   * fenced until an idempotent retry acknowledges the end; an exit event alone is not that proof. */
+  private unknownEnds = new Set<string>()
+  /** Shell-owned cleanup runs after end processing and, for session host, its kill acknowledgement. */
+  private sessionEndedListeners = new Set<(persistKey: string) => void>()
   /** persistKey (node id) → the co-viewers of a session that was RECYCLED (moved into a worktree),
    *  waiting to be told to restart onto the replacement session. Held — not sent — until that
    *  session is registered (`spawnSession`), so a co-viewer's restart can never win the race and
    *  spawn the node in its own stale cwd. See `recycleSession`. */
   private pendingRecycle = new Map<
     string,
-    { sessionId: string; clients: Set<ClientId>; timer: ReturnType<typeof setTimeout> }
+    {
+      sessionId: string
+      clients: Set<ClientId>
+      /** The exact view allowed to cold-create the replacement. A Kanban modal shares its
+       * renderer's ClientId, but it is still a co-viewer: letting it win would return `fresh:true`
+       * to a surface that deliberately performs no cold agent relaunch, while the primary canvas
+       * view subsequently joins `fresh:false`. */
+      owner: SubKey | null
+      /** Trusted target preflighted by confirmed recycle. The primary view is still parked if it
+       * races back with stale React props; only a create carrying this exact profile/cwd may spend
+       * the replacement reservation and establish the new generation. */
+      target?: PtyRecycleTarget
+      waiters: Array<{
+        clientId: ClientId
+        options: PtyCreateOptions
+        resolve: (result: PtyCreateResult) => void
+        reject: (error: unknown) => void
+      }>
+      timer: ReturnType<typeof setTimeout>
+    }
   >()
   /**
    * persistKey (node id) → the client that DELETED it. The respawn guard for clients the
@@ -610,6 +893,25 @@ export class PtyManager {
   private tmuxPath: string | null = null
   private confPath = ''
   private getSettings: () => Settings = () => DEFAULT_SETTINGS
+
+  /**
+   * Is this account id one of the managed CODEX accounts? Asked instead of guessing from the id's
+   * shape: `codexAccounts` and `claudeAccounts` share an id alphabet, so only the list can tell
+   * them apart (issue #345). Reads LIVE settings, so an account added after init is seen.
+   */
+  private isCodexAccount(accountId: string): boolean {
+    return this.getSettings().codexAccounts.some((a) => a.id === accountId)
+  }
+  /** Literal model-gateway key loaded by the shell's secret service during startup. */
+  private getModelGatewaySecret: () => string | null = () => null
+  /**
+   * What the OWNING project contributes to a session's env + shell, or null when it contributes
+   * nothing. Injected (not constructed) for the same reason `getSettings` is: core cannot see the
+   * workspace store or the trust store, and both shells wire the SAME core factory
+   * (`makeProjectSpawnOverrides`). Unset ⇒ the feature is simply absent — every spawn behaves
+   * exactly as it did before it existed.
+   */
+  private readProjectSpawnOverrides: ProjectSpawnOverridesReader | null = null
   /** ONE shared snapshot interval for all persisted sessions — a per-session interval spawned
    *  one tmux/ssh capture subprocess per session per tick, forever, even for idle terminals. */
   private snapshotTimer: ReturnType<typeof setInterval> | null = null
@@ -670,9 +972,20 @@ export class PtyManager {
   /** The child-process seam for shadow clients. Undefined in production, where `ControlModeClient`
    *  uses `child_process` (see tmux-control-client.ts); tests inject a fake spawner. */
   private readonly controlSpawn: ControlSpawn | undefined
+  private readonly confirmedProcessRun: ConfirmedProcessRun
+  /** Injectable only so Windows-only routing stays behavior-testable on every CI host. */
+  private readonly runtimePlatform: NodeJS.Platform
 
-  constructor(deps: { controlSpawn?: ControlSpawn } = {}) {
+  constructor(
+    deps: {
+      controlSpawn?: ControlSpawn
+      confirmedProcessRun?: ConfirmedProcessRun
+      runtimePlatform?: NodeJS.Platform
+    } = {}
+  ) {
     this.controlSpawn = deps.controlSpawn
+    this.confirmedProcessRun = deps.confirmedProcessRun ?? runAsync
+    this.runtimePlatform = deps.runtimePlatform ?? os.platform()
   }
 
   private ensureSnapshotTimer(): void {
@@ -687,7 +1000,7 @@ export class PtyManager {
       anyPersisted = true
       if (!session.outputSinceSnapshot) continue // idle since the last capture — skip the spawn
       session.outputSinceSnapshot = false
-      void this.snapshotScrollback(session.persistKey, session.sshRemote).then((ok) => {
+      void this.snapshotScrollback(session.persistKey, session.sshRemote, !!session.sessionHost).then((ok) => {
         // Transient capture failure (ssh blip, tmux busy): put the dirty bit back so the next
         // tick retries — otherwise a quiet session would never be snapshotted again.
         if (!ok) session.outputSinceSnapshot = true
@@ -754,7 +1067,7 @@ export class PtyManager {
     // a reboot. The tmux session itself keeps running, so this only races a same-instant capture.
     // Skipped when nothing arrived since the last periodic capture (pane content is unchanged).
     if (session.persistKey && session.outputSinceSnapshot)
-      void this.snapshotScrollback(session.persistKey, session.sshRemote)
+      void this.snapshotScrollback(session.persistKey, session.sshRemote, !!session.sessionHost)
     // Remember what a later shadow would have no other way to learn — the grid the painter last
     // enforced (so the pane is not left to reflow), and whether this node's tmux was REMOTE (so it
     // is never shadowed against our local socket). The `Session` holding both goes with `forget`
@@ -1003,7 +1316,7 @@ export class PtyManager {
    *    is a name we have no claim to (a remote node's local orphan, another machine's idea of it, a
    *    session someone else made). An unknown key is not evidence of a session.
    *  - a node whose record says `remote`: its tmux is on the far host. Reaching it means the
-   *    project's ControlMaster (`remoteTmuxSendKeysArgs`), not this channel; refusing is the honest
+   *    project's ControlMaster (`remoteTmuxPasteArgs`), not this channel; refusing is the honest
    *    answer until that exists.
    */
   async backgroundWrite(persistKey: string, data: string): Promise<boolean> {
@@ -1148,8 +1461,19 @@ export class PtyManager {
   }
 
   /** Must run after app is ready (needs userData path). */
-  init(getSettings: () => Settings): void {
+  init(
+    getSettings: () => Settings,
+    getModelGatewaySecret: () => string | null = () => null
+  ): void {
     this.getSettings = getSettings
+    this.getModelGatewaySecret = getModelGatewaySecret
+    // Register the custom-id → baseAgent resolver so the capability predicates in
+    // shared/agents/config (hasHooks, canResume, mintsSessionId, hasPermissionMode,
+    // canControlCanvas, …) resolve a custom agent's INHERITED harness. config.ts takes only an id
+    // (it cannot import the settings store without a cycle/platform split), so the lookup is
+    // injected here: the closure reads LIVE settings, so registering once at init is enough — a
+    // settings update is reflected on the next predicate call.
+    setCustomAgentBaseResolver((id) => findCustomAgent(this.getSettings().customAgents, id)?.baseAgent)
     // Prewarm the login-shell PATH probe now so the first terminal spawn doesn't wait on it —
     // and re-run the tmux probe once it lands: findTmux no longer spawns a login shell of its
     // own, so a tmux living only on the user's shell PATH is invisible until this resolves.
@@ -1160,6 +1484,48 @@ export class PtyManager {
     // machine at its device limit is exactly a machine where spawning one more process is a bad
     // idea. See pty-devices.ts.
     primePtyCeiling()
+  }
+
+  /**
+   * Wire the project settings → spawn overrides reader (SDD: project-settings consumption, Task 4).
+   *
+   * A SEPARATE setter rather than a third `init` argument: the Server Edition constructs its
+   * workspace/trust stores AFTER `ptyManager.init(...)`, so an init parameter could only ever be
+   * wired on one of the two shells.
+   */
+  setProjectSpawnOverrides(read: ProjectSpawnOverridesReader | null): void {
+    this.readProjectSpawnOverrides = read
+  }
+
+  /**
+   * The project's contribution to THIS spawn — bounded and fail-open on every path.
+   *
+   *  - no reader wired, or no `ownerProjectId` (the pane is UNPROVEN — see PtyCreateOptions) ⇒ no
+   *    overrides, and the reader is not even asked,
+   *  - a reader that rejects ⇒ no overrides,
+   *  - a reader that HANGS ⇒ no overrides after PROJECT_OVERRIDES_TIMEOUT_MS. The read still
+   *    settles on its own afterwards (nothing is cancelled); this spawn just stops waiting.
+   */
+  private async projectSpawnOverrides(
+    options: PtyCreateOptions
+  ): Promise<ProjectSpawnOverrides | null> {
+    const read = this.readProjectSpawnOverrides
+    if (!read || !options.ownerProjectId) return null
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        read(options.ownerProjectId),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), PROJECT_OVERRIDES_TIMEOUT_MS)
+          // Never hold the process open for a settings read nobody is waiting on any more.
+          timer.unref?.()
+        })
+      ])
+    } catch {
+      return null
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   /** Probe tmux and write/push the generated config. Idempotent and safe to re-run: a later
@@ -1179,7 +1545,8 @@ export class PtyManager {
     if (!found) return
     this.confPath = path.join(platform().userDataDir, 'tmux.conf')
     try {
-      fs.writeFileSync(this.confPath, tmuxConf(this.getSettings().tmuxScrollback))
+      const s = this.getSettings()
+      fs.writeFileSync(this.confPath, tmuxConf(s.tmuxScrollback, s.tmuxLeadPaneWidth))
     } catch {
       // If we can't write the config, stay on the plain-shell fallback.
       return
@@ -1200,6 +1567,53 @@ export class PtyManager {
   /** Absolute tmux path (or null if tmux is unavailable). Used by the context-link backend. */
   getTmuxBin(): string | null {
     return this.tmuxPath
+  }
+
+  /** `update-environment` names already pushed to the running server this app-run (plus the
+   *  conf-baked set), so a custom agent's spawn costs at most one `set-option` per NEW key. */
+  private updateEnvKeys: Set<string> | null = null
+
+  /** Make the shared tmux server copy these client-env names into new sessions. The conf bakes
+   *  the fixed gateway list; a CUSTOM agent's env keys are user-defined and can only be appended
+   *  at runtime. Names ride the `set-option` argv — names only, values never (values reach tmux
+   *  through the client's process environment; that is the point of this whole path). Failure is
+   *  fail-open twice over: with NO server running, the session about to spawn starts the server
+   *  itself and its panes inherit the client env directly; a name that cannot be appended costs
+   *  that var on a shared server, never the terminal. */
+  private ensureUpdateEnvKeys(names: string[]): void {
+    if (!this.tmuxPath) return
+    const wanted = names.filter(
+      (n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) && n !== 'PATH' && n !== 'LANG'
+    )
+    if (!wanted.length) return
+    if (!this.updateEnvKeys) {
+      this.updateEnvKeys = new Set(MODEL_GATEWAY_ENV_KEYS)
+      try {
+        const out = execFileSync(
+          this.tmuxPath,
+          ['-L', TMUX_SOCKET, 'show-options', '-g', 'update-environment'],
+          { stdio: ['ignore', 'pipe', 'ignore'] }
+        ).toString()
+        for (const m of out.matchAll(/update-environment\[\d+\]\s+(\S+)/g)) {
+          this.updateEnvKeys.add(m[1])
+        }
+      } catch {
+        /* no server yet — the conf list is what a fresh server will have */
+      }
+    }
+    for (const name of wanted) {
+      if (this.updateEnvKeys.has(name)) continue
+      try {
+        execFileSync(
+          this.tmuxPath,
+          ['-L', TMUX_SOCKET, 'set-option', '-ga', 'update-environment', name],
+          { stdio: 'ignore' }
+        )
+        this.updateEnvKeys.add(name)
+      } catch {
+        /* no server yet — fresh-server sessions inherit the client env directly */
+      }
+    }
   }
 
   registerIpc(): void {
@@ -1266,16 +1680,47 @@ export class PtyManager {
     // Optional TRAILING `everySocket`: only the session-memory panel's SPECULATIVE kill sets it,
     // and only for a row it holds no session for (see `localKillSockets`). `=== true` because the
     // value arrives verbatim off the wire; absent ⇒ the narrow, historical single-socket kill.
-    platform().onWithSender(
+    platform().handleWithSender(
       IPC.ptyDestroy,
       (senderId: number, persistKey: string, everySocket?: unknown) =>
         this.endFromClient(senderId, IPC.ptyDestroy, persistKey, 'delete', everySocket === true)
     )
+    // Version skew: older desktop/mobile/relay clients still cast this channel. Keep that path
+    // functional, but contain its Promise — a failed host kill must neither tear down local state
+    // nor become an unhandled rejection in the shell that cannot receive an acknowledgement.
+    platform().onWithSender(
+      IPC.ptyDestroy,
+      (senderId: number, persistKey: string, everySocket?: unknown) => {
+        void this.endFromClient(
+          senderId,
+          IPC.ptyDestroy,
+          persistKey,
+          'delete',
+          everySocket === true,
+          false
+        ).catch((error) =>
+          console.warn(
+            `[pty] legacy destroy for ${persistKey} was not confirmed`,
+            error instanceof Error ? error.message : String(error)
+          )
+        )
+      }
+    )
     // Sender-aware for the opposite reason: the client that RECYCLED the node drives its own
     // respawn, so it is the one client that must NOT be sent the restart notice.
-    platform().onWithSender(IPC.ptyRecycle, (senderId: number, persistKey: string) =>
+    platform().handleWithSender(IPC.ptyRecycle, (senderId: number, persistKey: string) =>
       this.endFromClient(senderId, IPC.ptyRecycle, persistKey, 'recycle')
     )
+    // Same compatibility bridge as destroy above. New clients await the handler; old casts keep
+    // working, with rejection contained because their protocol has nowhere to return it.
+    platform().onWithSender(IPC.ptyRecycle, (senderId: number, persistKey: string) => {
+      void this.endFromClient(senderId, IPC.ptyRecycle, persistKey, 'recycle', false, false).catch((error) =>
+        console.warn(
+          `[pty] legacy recycle for ${persistKey} was not confirmed`,
+          error instanceof Error ? error.message : String(error)
+        )
+      )
+    })
     platform().handle(IPC.ptyReadScrollback, (persistKey: string) =>
       readScrollback(persistKey)
     )
@@ -1284,6 +1729,9 @@ export class PtyManager {
     )
     platform().handle(IPC.ptyTmuxStatus, () => this.tmuxStatus())
     platform().handle(IPC.ptyPaneCommand, (persistKey: string) => this.paneCommand(persistKey))
+    platform().handle(IPC.ptyTerminateForeground, (persistKey: string, expectedAgentId?: string) =>
+      this.terminateForeground(persistKey, expectedAgentId)
+    )
   }
 
   /** Feeds the renderer's "tmux not found" banner. Without tmux the app silently degrades to a
@@ -1360,16 +1808,26 @@ export class PtyManager {
     channel: string,
     persistKey: string,
     intent: EndIntent,
-    everySocket = false
+    everySocket = false,
+    acknowledged = true
   ): Promise<void> {
     if (typeof persistKey !== 'string' || !persistKey || persistKey.length > REF_MAX_LEN)
-      return Promise.resolve()
-    if (!this.allowEnd(clientId, channel)) return Promise.resolve()
+      return this.refuseClientEnd(channel, acknowledged, 'invalid node id')
+    if (!this.allowEnd(clientId, channel))
+      return this.refuseClientEnd(channel, acknowledged, 'rate limit exceeded; retry later')
     return this.endSession(clientId, persistKey, intent, everySocket)
   }
 
+  /** New end requests must reject on refusal or their renderer will treat a no-op as success.
+   * Legacy casts have no response carrier, so they keep their historical silent drop. */
+  private refuseClientEnd(channel: string, acknowledged: boolean, reason: string): Promise<void> {
+    if (!acknowledged) return Promise.resolve()
+    const operation = channel === IPC.ptyRecycle ? 'recycle' : 'destroy'
+    return Promise.reject(new Error(`pty ${operation} refused: ${reason}`))
+  }
+
   /** Take one token from this client's bucket for a session-ending channel (see PTY_END_BUDGET).
-   *  Excess casts are dropped silently — never an error, never a disconnect. */
+   *  A request rejects on exhaustion; a legacy cast is dropped silently. */
   private allowEnd(clientId: ClientId, channel: string): boolean {
     const key = `${clientId}:${channel}`
     const now = Date.now()
@@ -1415,11 +1873,64 @@ export class PtyManager {
   private async create(clientId: ClientId, options: PtyCreateOptions): Promise<PtyCreateResult> {
     const key = options.persistKey
     if (!key) return this.spawnNew(clientId, options)
-    // Co-attach: a live session for this node id already exists in THIS process (another client,
-    // or this client's own second view). Subscribe to it instead of spawning a second tmux client
-    // — `-D` would otherwise kick the first viewer off.
-    const joined = this.join(clientId, options, key)
-    if (joined) return joined
+    // SECURITY — the choke point for the node id. Every session spawn (local tmux, plain shell,
+    // SSH remote) goes through here, `pty:create` validates its payload nowhere, and node ids come
+    // from `.nodeterm/project.json` — a file that travels in a cloned/shared repo and is written on
+    // remote hosts. The id reaches a REMOTE SHELL verbatim as `NODETERM_NODE_ID=<key>`; quoting at
+    // that splice (`remoteTmuxPtyArgs`) is the primary fix and this is the second layer, so a
+    // future splice that forgets to quote is not instantly exploitable.
+    //
+    // FAILURE DIRECTION — refuse, don't sanitise. Nothing legitimate is refused: every id the app
+    // mints comes from `nextId()` (`<prefix>-<base36>-<counter>`) or `uuid()`, both inside
+    // `[A-Za-z0-9._-]`. And sanitising would be worse than a refusal here rather than merely
+    // safer-looking: `NODETERM_NODE_ID` is a CROSS-BOUNDARY CONTRACT — Canvas.tsx keys
+    // `agentStatus.byId` off the raw node id — so a silently rewritten id would report status for a
+    // node that does not exist, i.e. a terminal that looks fine and is permanently dark. A thrown
+    // error surfaces in the pane where someone can read it.
+    if (!isSafeNodeId(key))
+      throw new Error(
+        `Refusing to open this terminal: its node id is not a safe id (allowed: letters, digits, ` +
+          `dot, dash, underscore; max ${NODE_ID_MAX}). A project file with an id like this cannot be ` +
+          `trusted — it is how a shared or cloned repo would smuggle a command onto a remote host.`
+      )
+    // A generic end and an awaited profile recycle are separate transactions, but both reserve this
+    // node name while their backend outcome is pending. Wait before consulting either the live index
+    // or a replacement reservation so an early host exit cannot authorize a competing generation.
+    const ending = this.ending.get(key)
+    if (ending) {
+      await ending.promise.catch(() => undefined)
+      return this.create(clientId, options)
+    }
+    const confirmedRecycle = this.confirmedRecycles.get(key)
+    if (confirmedRecycle) {
+      await confirmedRecycle.catch(() => undefined)
+      return this.create(clientId, options)
+    }
+    if (this.unknownEnds.has(key))
+      throw new Error('session end outcome unknown; retry the close before reopening this node')
+
+    // A recycle reserves the replacement generation for the client that chose its new profile/cwd.
+    // A co-viewer's create still carries stale machine-local options; let it wait for the owner's
+    // exact replacement and then join, never race to become the new backend creator itself.
+    const pendingRecycle = this.pendingRecycle.get(key)
+    const requestingView = subKey(clientId, options.viewerId ?? PRIMARY_VIEWER)
+    // Profile-switch targets arrive with the windows-terminal-profiles phase; until then no
+    // pendingRecycle entry carries one, so an absent target always matches.
+    const matchesRecycleTarget = !pendingRecycle?.target
+    if (
+      pendingRecycle &&
+      (pendingRecycle.owner !== requestingView || !matchesRecycleTarget)
+    ) {
+      return new Promise<PtyCreateResult>((resolve, reject) => {
+        // Recheck after allocating the promise: `fireRecycled` is synchronous, but keeping the
+        // exact entry check makes a future awaited boundary here unable to strand this waiter.
+        if (this.pendingRecycle.get(key) !== pendingRecycle) {
+          void this.create(clientId, options).then(resolve, reject)
+          return
+        }
+        pendingRecycle.waiters.push({ clientId, options, resolve, reject })
+      })
+    }
     // Same-tick race: spawnNew() awaits a `tmux has-session` SUBPROCESS (tens of ms, not a
     // microtask) before spawnSession registers the session in `byPersistKey`, so two clients
     // opening the same node in that window would BOTH miss the index and both spawn — and the
@@ -1427,6 +1938,9 @@ export class PtyManager {
     // is published as an in-flight promise from the TOP of create(): a racing create awaits it
     // and then takes the subscribe branch. (No locking primitive: the promise IS the barrier —
     // the single-user path never sees an in-flight entry and behaves exactly as before.)
+    // Check the barrier BEFORE the live-session index. A session-host shim is registered while
+    // its asynchronous attach is still pending; treating that provisional entry as joinable lets
+    // a racing client receive a live-looking id even if `ready` rejects a moment later.
     const inflight = this.inflight.get(key)
     if (inflight) {
       await inflight.catch(() => undefined) // the other spawn failed → fall through and try ourselves
@@ -1439,6 +1953,12 @@ export class PtyManager {
       // on a *new* in-flight entry is exactly the same wait as the one we just did.
       if (this.inflight.get(key)) return this.create(clientId, options)
     }
+    // Co-attach: a live session for this node id already exists in THIS process (another client,
+    // or this client's own second view). Subscribe to it instead of spawning a second tmux client
+    // — `-D` would otherwise kick the first viewer off. This runs after the in-flight barrier, so
+    // every session visible here has completed its asynchronous session-host attach.
+    const joined = this.join(clientId, options, key)
+    if (joined) return joined
     // Another client DELETED this node (and there is no live session for it — `join` above already
     // covers a resurrection by its owner). Refuse rather than spawn: see `tombstones`. Checked
     // AFTER the in-flight barrier so a create racing the owner's own respawn joins it instead.
@@ -1451,7 +1971,14 @@ export class PtyManager {
     const clear = (): void => {
       if (this.inflight.get(key) === spawn) this.inflight.delete(key)
     }
-    spawn.then(clear, clear)
+    spawn.then(clear, (error) => {
+      clear()
+      // The reserved owner failed to establish the replacement (resolver failure, spawn throw,
+      // rejected attach, or exit-before-ready). Release co-viewers immediately with ready:false;
+      // the timeout exists only for an owner that never attempts the create at all.
+      if (this.pendingRecycle.get(key)?.owner === requestingView) this.fireRecycled(key, false)
+      return error
+    })
     return spawn
   }
 
@@ -1558,23 +2085,48 @@ export class PtyManager {
     if (options.requireRemote && !(options.sshRemote && options.persistKey && findSsh())) {
       return { sessionId: '', fresh: false, unavailable: 'ssh' }
     }
+    // FAIL-CLOSED Codex account scope (S6 §5 property 4 / Decision 2, the carried PR-1 obligation).
+    // A LOCAL Codex spawn that EXPLICITLY selected a managed account whose home is missing REFUSES
+    // here — it must never fall through and spawn against the SYSTEM `~/.codex` (silently acting as
+    // the wrong login is a worse failure for an explicit switch than for a first spawn). This is
+    // deliberately STRICTER than the Claude account path below, which falls back with a warning
+    // chip. `resolveCodexSessionScope` returns `{ unavailable: 'codex-account' }` for exactly that
+    // case; we map it straight through to a real refusal and spawn NOTHING. The system account (no
+    // id) always resolves. Remote (ssh) Codex sessions carry their account env via tmux `-e`.
+    if (needsCodexAccountScope(options.agentId, options.accountId, (id) => this.isCodexAccount(id)) && !options.sshRemote) {
+      const scope = resolveCodexSessionScope(platform().userDataDir, options.accountId)
+      if (isCodexScopeRefusal(scope)) {
+        return { sessionId: '', fresh: false, unavailable: 'codex-account' }
+      }
+    }
     // A tmux-backed session is "fresh" (cold start) when no live session exists to reattach to
     // — i.e. first open, or after a machine reboot killed the tmux server. Plain (non-tmux)
     // sessions are always fresh: they have no cross-restart continuity. The renderer uses this
     // to decide whether to replay the persisted scrollback and re-launch a resumable agent.
-    const tmuxBacked =
-      !!this.tmuxPath && this.getSettings().tmuxEnabled && !!options.persistKey
+    // The Windows-profile warm-backend probe (attach-only reattach of a proven session-host or
+    // tmux generation, decided ahead of trusted profile resolution) lands with the
+    // windows-terminal-profiles phase; until then nothing assigns this and every create takes the
+    // ordinary attach-or-create path below.
+    let warmWindowsBackend: 'session-host' | 'tmux' | undefined
+    const tmuxBacked = !!this.tmuxPath && this.getSettings().tmuxEnabled && !!options.persistKey
     // For an SSH-project node, "fresh" is decided by the REMOTE tmux server (over the project's
     // ControlMaster), not the local one. The remote `has-session` is a full network round-trip,
     // so it MUST be async (`runAsync`) — a synchronous probe here would freeze every window/IPC
     // for its duration. Falls through to the local tmux/plain logic otherwise (also async: a
     // bulk project load fires one create() per node, and even cheap probes add up serialized).
-    const fresh = options.sshRemote
+    //
+    // `true` here for a node that ends up SESSION-HOST-backed is only a PLACEHOLDER: unlike tmux
+    // (a cheap name-only `has-session` probe, decided before spawning anything) the session-host
+    // backend's attach-or-create IS the probe — see the `spawned?.sessionHost` branch below, which
+    // overwrites both `fresh` and `screen` from that same round trip once `spawnSession` returns.
+    let fresh = options.sshRemote
       ? !(await this.remoteSessionExists(
           options.sshRemote,
           sessionName(options.persistKey as string)
         ))
-      : tmuxBacked
+      : warmWindowsBackend
+        ? false
+        : tmuxBacked
         ? !(await this.tmuxSessionExists(options.persistKey as string))
         : true
     // Ensure the login-shell PATH is resolved (prewarmed in init(); usually already settled)
@@ -1586,17 +2138,168 @@ export class PtyManager {
     if (hasSharedIdentity((options.agentId ?? 'claude') as AgentId) && !options.sshRemote) {
       installCodexLauncher()
     }
-    const sessionId = this.spawnSession(options, clientId, undefined)
+    // Resolved HERE rather than inside `spawnSession` because that function is synchronous and two
+    // of its three callers (`createDetached`/`attachDetached`, the relay host's attach path) are
+    // synchronous public API.
+    //
+    // Those two are NOT merely attaches — `attachDetached` goes through `tmux new-session -A`, which
+    // CREATES when the host's session died (that is exactly what `sessionExists` is asked ahead of,
+    // and what `fresh` reports). What makes them override-less is narrower and true either way: the
+    // relay host passes only `{cols, rows}` (host-service.ts), so those spawns carry no
+    // `ownerProjectId` — and no cwd, agent, account or hook env either. A mirrored client that
+    // lands on a re-created session gets the same bare login shell it got before this feature.
+    const projectOverrides = await this.projectSpawnOverrides(options)
+    // Resolved HERE for the same synchronous-spawnSession reason as projectOverrides — and the
+    // relay host's detached callers pass no `sshRemote` at all, so this is the one path that needs
+    // it. Re-derive the login-agent pin for the endpoint (issue #427): same memoized `ssh -G`
+    // probe the ControlMaster's connect uses, and it OVERWRITES any inbound value — `sshRemote` is
+    // renderer-built and its conn can descend from a shareable project file, so only the local
+    // probe may decide which agent socket the argv builders pin. The annotated conn is what the
+    // session stores, so every later remote op (capture, sendText, remote git) rides the same
+    // answer. Fail-open: a failed probe ⇒ undefined ⇒ the pre-#427 command lines.
+    if (options.sshRemote) {
+      options = {
+        ...options,
+        sshRemote: {
+          ...options.sshRemote,
+          conn: {
+            ...options.sshRemote.conn,
+            identityAgentSock: await probeAgentSockToPin(options.sshRemote.conn).catch(
+              () => undefined
+            )
+          }
+        }
+      }
+    }
+    const sessionId = this.spawnSession(
+      options,
+      clientId,
+      undefined,
+      warmWindowsBackend,
+      projectOverrides
+    )
     const spawned = this.sessions.get(sessionId)
+    // PANE OWNERSHIP (agent messaging, PR #237 fix round 2): record the OWNING project of a pane
+    // this process just GENUINELY spawned. Gated on `fresh` — an attach/co-attach to a session
+    // someone else spawned (incl. an app-restart re-attach) leaves the pane UNPROVEN, so a second
+    // project that merely opens another's node id cannot claim it. The owner is the renderer's
+    // machine-local project id, never the git-shared file id. See `agents/pane-ownership.ts`.
+    if (shouldRecordOwnership(fresh, options.persistKey, options.ownerProjectId))
+      recordFreshSpawnOwner(options.persistKey as string, options.ownerProjectId)
+    if (warmWindowsBackend === 'tmux') {
+      // The first strict probe deliberately preceded profile resolution. Recheck after launching
+      // attach-only: if the named session disappeared in that window, never return the transient
+      // tmux client as a usable generation. `attach-session` itself cannot cold-create.
+      const stillExists = await this.confirmedTmuxSessionExists(options.persistKey as string)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      if (!stillExists || !spawned || this.sessions.get(sessionId) !== spawned) {
+        if (spawned && this.sessions.get(sessionId) === spawned)
+          this.discardFailedSpawn(sessionId, spawned)
+        throw new Error('The existing terminal session disappeared before it could be reattached.')
+      }
+    }
+    // The session-host backend is NOT a painter (see docs/windows-session-host.md, "The seeding
+    // trap"): a warm attach there gets no free redraw the way a real tmux client provides, so
+    // this create must carry the screen to seed itself — exactly the same field a same-process
+    // co-attach JOIN already populates via `join()` below. `SessionHostPty.ready` is the SAME
+    // attach-or-create round trip `spawnSession` just kicked off; awaiting it here costs nothing
+    // extra (the socket write already happened) and is the only way to learn its real `fresh`.
+    let screen: string | undefined
+    if (spawned?.sessionHost) {
+      try {
+        const info = await (spawned.proc as unknown as SessionHostPty).ready
+        // `ready` and the pty's natural exit are independent host messages. If exit won the race,
+        // its handler already retired this exact generation; returning the captured Session object
+        // here would hand the renderer a plausible persistent id that no longer accepts writes.
+        if (this.sessions.get(sessionId) !== spawned) {
+          throw new Error('The terminal session exited before it became ready.')
+        }
+        fresh = info.fresh
+        screen = info.screen
+        // Session-host registration is provisional until the exact ready barrier above succeeds.
+        // Only now is an owner's resurrection real enough to remove a prior deletion tombstone.
+        if (spawned.indexKey) this.tombstones.delete(spawned.indexKey)
+        // A recycle notice must describe a usable replacement, not merely a provisional local
+        // Session record. Session-host registration precedes this async barrier, so publish now.
+        if (spawned.indexKey && this.pendingRecycle.has(spawned.indexKey))
+          this.fireRecycled(spawned.indexKey, true)
+      } catch (error) {
+        // The shim is registered synchronously so output callbacks have somewhere to land, but a
+        // rejected attach means no usable pty ever existed. Retire every local claim and detach
+        // the shim before propagating the real failure; returning its id creates a terminal that
+        // looks alive while every write disappears.
+        if (this.sessions.get(sessionId) === spawned) this.discardFailedSpawn(sessionId, spawned)
+        if (error instanceof SessionHostProtocolCompatibilityError) throw error
+        throw error
+      }
+    }
     // Surface a missing-account-dir fallback so the renderer can flag the node's account chip.
     const accountFallback = spawned?.accountFallback
     // The session's `persistKey` is set iff the spawn actually landed on a tmux, local or remote
     // (`persisted` in spawnSession) — i.e. exactly "this session survives losing its client",
     // which is what the renderer's cache-dispose levers must not assume. See PtyCreateResult.
     const persistent = !!spawned?.persistKey
-    return accountFallback
-      ? { sessionId, fresh, accountFallback, persistent }
-      : { sessionId, fresh, persistent }
+    // Stale-cwd probe (issue #464), WARM local-tmux reattach only: `new-session -A` reattached a
+    // session whose shell may sit on a DELETED directory inode (a re-created same-named folder is
+    // a different inode, so the getcwd errors never self-heal). A fresh spawn already validated
+    // its cwd above; a plain shell has no session that outlived anything; an SSH-remote session's
+    // cwd lives on the host (its probe would need a remote round trip — deliberately out of v1).
+    // Failure/unknowable ⇒ absent ⇒ no banner: the flag is only ever raised on tmux's own answer.
+    const staleCwd =
+      !fresh && tmuxBacked && !options.sshRemote && !spawned?.sessionHost && options.persistKey
+        ? await this.paneCwdStale(options.persistKey)
+        : false
+    return {
+      sessionId,
+      fresh,
+      persistent,
+      ...(accountFallback ? { accountFallback } : {}),
+      ...(staleCwd ? { staleCwd: true as const } : {}),
+      ...(screen ? { screen } : {})
+    }
+  }
+
+  /**
+   * Is the live tmux session's working directory GONE (deleted, or deleted and re-created at the
+   * same path — issue #464)? Asks tmux for `#{pane_current_path}` — a format present since 1.7,
+   * so no version hazard — and classifies through the pure `classifyPaneCwd` (see pane-cwd.ts for
+   * the per-platform signals, one measured and one inferred). Exact-match target: `=name:` —
+   * the trailing colon matters, and is MEASURED (tmux 3.4): for a target-PANE a bare `=name`
+   * resolves NOTHING silently (exit 0, every format empty), while `=name:` is "exactly this
+   * session, its active pane". Without `=`, tmux falls back to fnmatch-then-prefix matching and
+   * could answer about a DIFFERENT node whose id extends this one (the same trap the kill path
+   * documents). Any failure answers `false` — no banner on a guess.
+   */
+  private async paneCwdStale(persistKey: string): Promise<boolean> {
+    if (!this.tmuxPath) return false
+    try {
+      const { stdout } = await runAsync(
+        this.tmuxPath,
+        [
+          '-L',
+          TMUX_SOCKET,
+          'display-message',
+          '-p',
+          '-t',
+          `=${sessionName(persistKey)}:`,
+          '#{pane_current_path}'
+        ],
+        { timeout: PROBE_TIMEOUT_MS }
+      )
+      // Strip ONLY the transport's trailing newline — a path may legally end in spaces, and the
+      // Linux " (deleted)" suffix must survive untouched for the classifier to see it.
+      const reported = stdout.replace(/\r?\n$/, '')
+      const dirExists = (p: string): boolean => {
+        try {
+          return fs.statSync(p).isDirectory()
+        } catch {
+          return false
+        }
+      }
+      return classifyPaneCwd(reported, dirExists) === 'stale'
+    } catch {
+      return false
+    }
   }
 
   /** Does the node's remote tmux session exist (over the project's ControlMaster)? Async so the
@@ -1627,6 +2330,12 @@ export class PtyManager {
     return undefined
   }
 
+  /** The exact live generation for a node id, including a non-persistent indexed plain shell. */
+  private liveSessionForPersistKey(persistKey: string): Session | undefined {
+    const indexedId = this.byPersistKey.get(persistKey)
+    return (indexedId ? this.sessions.get(indexedId) : undefined) ?? this.sessionByPersistKey(persistKey)
+  }
+
   /**
    * The live SSH-remote handle for a node id, if its session is running on a remote host.
    * Used by the remote context/subagent tails to read the node's transcript over the same
@@ -1652,7 +2361,16 @@ export class PtyManager {
    * the caller treats it as a warm join and types nothing into it.
    */
   async sessionExists(persistKey: string): Promise<boolean> {
-    return this.tmuxSessionExists(persistKey)
+    if (this.liveSessionForPersistKey(persistKey)) return true
+    const probes: Promise<boolean>[] = []
+    if (this.tmuxPath) probes.push(this.tmuxSessionExists(persistKey))
+    if (this.getSettings().tmuxEnabled && sessionHostSupported()) {
+      // A failed host read is not evidence of absence. This mirrors tmuxSessionExists' fail-safe
+      // direction and prevents a reconnect blip from being mistaken for a cold generation.
+      probes.push(sessionHostHasSession(sessionName(persistKey)).catch(() => true))
+    }
+    if (probes.length === 0) return false
+    return (await Promise.all(probes)).some(Boolean)
   }
 
   /** Whether a tmux session for this node id currently exists (server alive + session present).
@@ -1670,6 +2388,29 @@ export class PtyManager {
       // the reboot case) is absence; a spawn failure (EAGAIN under a bulk project load) is
       // not, and cold-restoring on it would type into a live session.
       return !probeSaysAbsent(e)
+    }
+  }
+
+  /** Destructive-confirmation variant of the warm-attach probe. Warm attach treats an unavailable
+   * probe as "possibly exists" to avoid typing into a live session; an awaited restart must not
+   * report success on uncertainty, because its caller mutates profile state only after this says
+   * the old generation ended. */
+  private async confirmedTmuxSessionExists(persistKey: string): Promise<boolean> {
+    if (!this.tmuxPath) return false
+    try {
+      await this.confirmedProcessRun(
+        this.tmuxPath,
+        ['-L', TMUX_SOCKET, 'has-session', '-t', sessionName(persistKey)],
+        { timeout: PROBE_TIMEOUT_MS }
+      )
+      return true
+    } catch (error) {
+      if (probeSaysAbsent(error)) return false
+      throw new Error(
+        `Could not confirm the terminal session before restarting it: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
     }
   }
 
@@ -1707,7 +2448,22 @@ export class PtyManager {
    * live output. Empty string if tmux is unavailable or the session doesn't exist yet.
    */
   async captureSnapshot(persistKey: string): Promise<string> {
-    if (!this.tmuxPath) return ''
+    const live = this.liveSessionForPersistKey(persistKey)
+    if (live?.sessionHost) {
+      try {
+        return await sessionHostCapture(sessionName(persistKey), false)
+      } catch {
+        return ''
+      }
+    }
+    if (!this.tmuxPath) {
+      if (!this.getSettings().tmuxEnabled || !sessionHostSupported()) return ''
+      try {
+        return await sessionHostCapture(sessionName(persistKey), false)
+      } catch {
+        return ''
+      }
+    }
     try {
       const { stdout } = await runAsync(
         this.tmuxPath,
@@ -1763,7 +2519,12 @@ export class PtyManager {
     options: PtyCreateOptions,
     /** The client this session is spawned for, or null for a relay-served (detached) pty. */
     clientId: ClientId | null,
-    sinks: DetachedSinks | undefined
+    sinks: DetachedSinks | undefined,
+    /** A persistent generation proven before profile/cwd resolution; attach-only, never create. */
+    warmWindowsBackend?: 'session-host' | 'tmux',
+    /** What the OWNING project contributes (see `projectSpawnOverrides`) — already resolved,
+     *  because this function is synchronous. Null on every path with no proven project owner. */
+    overrides?: ProjectSpawnOverrides | null
   ): string {
     // PRE-FLIGHT — refuse before node-pty is touched, not after it fails.
     //
@@ -1860,7 +2621,15 @@ export class PtyManager {
 
     // Strip TMUX so tmux doesn't refuse to nest if the app itself was launched
     // from inside a tmux session.
-    const env = { ...process.env, TERM: 'xterm-256color' } as Record<string, string>
+    // COLORTERM is the truecolor handshake half the ecosystem checks before emitting 24-bit
+    // SGR (the other half asks tmux/terminfo). xterm.js renders truecolor natively, so
+    // advertise it — without this, zsh themes and TUIs quietly clamp to the 256 palette and
+    // the canvas terminals never match the user's real terminal colors (issue #78).
+    const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
+    // The Server Edition may receive a first-boot password through its own environment. That
+    // bootstrap credential belongs to the server process, never to the interactive shells and
+    // agent CLIs it launches; inheriting it here would expose it to every terminal node.
+    delete env.NODETERM_SERVER_PASSWORD
     delete env.TMUX
     delete env.TMUX_PANE
 
@@ -1893,6 +2662,10 @@ export class PtyManager {
       this.getSettings().hookReplyApprovals && (options.agentId ?? 'claude') === 'claude'
         ? PERM_WAIT_SECS_DEFAULT
         : 0
+    // Materialise this node's token BEFORE the session exists, so the very first hook event the
+    // agent fires can already read it. Local sessions only: a remote node's token is written on the
+    // HOST (see remote-hooks), because the host is where its hook script runs.
+    if (options.persistKey && !options.sshRemote) ensureNodeToken(options.persistKey)
     const hookEnv =
       options.persistKey && !options.sshRemote
         ? hookServer.buildPtyEnv(options.persistKey, options.agentId ?? 'claude', permWaitSecs)
@@ -1911,14 +2684,20 @@ export class PtyManager {
     // dir. The claude CLI then reads/writes credentials + transcripts there. Also strip
     // env auth vars that would silently shadow the account's OAuth login (an inherited
     // ANTHROPIC_API_KEY wins over CLAUDE_CONFIG_DIR credentials). System-default nodes
-    // (no accountId) are untouched. Remote (ssh) sessions get their account env via the
-    // remote tmux `-e` list instead (the local ssh client process doesn't need it).
+    // (no accountId) set nothing HERE — but they are not "untouched" on the tmux leg:
+    // CLAUDE_CONFIG_DIR is in ACCOUNT_SCOPE_UPDATE_ENV, so a client whose env lacks it makes
+    // tmux STRIP it from the new session, which is what keeps a server seeded by a managed
+    // account's client from leaking that account into every unbound session (#419). The
+    // missing-dir fallback below rides the same rule: accountDir nulled ⇒ no env var ⇒ the
+    // session genuinely lands on `~/.claude`, not on whatever the server global env held.
+    // Remote (ssh) sessions get their account env via the remote tmux `-e` list instead
+    // (the local ssh client process doesn't need it).
+    let accountFallback = false
     let accountDir =
       options.accountId && !options.sshRemote ? claudeConfigDirFor(options.accountId) : null
     // Missing/deleted account dir (spec: error handling) → fall back to system default
     // instead of pointing claude at a dead dir; the node then behaves like an unbound one.
     // `accountFallback` is surfaced to the renderer (warning chip) via the create() result.
-    let accountFallback = false
     if (accountDir && !fs.existsSync(accountDir)) {
       console.warn(`[accounts] config dir missing for ${options.accountId}, using system default`)
       accountDir = null
@@ -1929,9 +2708,92 @@ export class PtyManager {
       for (const k of AUTH_ENV_STRIP) delete env[k]
     }
 
+    // Managed/system Codex account scope (S6 §2.1). A LOCAL Codex session runs under an EXPLICIT
+    // CODEX_HOME + NODETERM_CODEX_ACCOUNT_ID: a managed id points at that account's private home
+    // (its own auth.json + thread DB); the SYSTEM account (no id) is written EXPLICITLY so it
+    // overwrites any managed scope a parent tmux server leaked in, rather than silently acting as
+    // the wrong login. Note this write lands on the CLIENT env — on a shared tmux server it only
+    // reaches the session because both names are in ACCOUNT_SCOPE_UPDATE_ENV (before that, the
+    // overwrite-the-leak promise held only for the client that happened to START the server; #419).
+    // The missing-explicit-account case already refused in spawnNew (fail-closed,
+    // property 4), so `codexSessionEnv` here never resolves an explicit id to the system home. Also
+    // strip env vars that would shadow the account's OAuth login with API-key auth.
+    if (needsCodexAccountScope(options.agentId, options.accountId, (id) => this.isCodexAccount(id)) && !options.sshRemote) {
+      const codexScope = codexSessionEnv(platform().userDataDir, options.accountId)
+      env.CODEX_HOME = codexScope.CODEX_HOME
+      env.NODETERM_CODEX_ACCOUNT_ID = codexScope.NODETERM_CODEX_ACCOUNT_ID
+      for (const k of CODEX_AUTH_ENV_STRIP) delete env[k]
+    }
+
+    // Shared model gateway: resolve through the node's BASE harness in one shared mapping, then
+    // apply it before custom-agent env. That precedence is intentional: an inheriting custom agent
+    // benefits from the one-click gateway by default, but env values it explicitly declares still
+    // win exactly as they did before this feature. Remote values travel through tmux `-e` below;
+    // do not leak them into the local ssh client process environment.
+    // A plain terminal has no agentId and must never receive provider credentials. The hook env's
+    // historical Claude fallback does not apply here: gateway access is an explicit agent
+    // capability, not a terminal default.
+    const gatewayEnv = options.agentId
+      ? modelGatewayEnv(
+          this.getSettings().modelGateway,
+          options.agentId,
+          options.agentModel,
+          process.env as Record<string, string | undefined>,
+          this.getModelGatewaySecret()
+        )
+      : {}
+    if (!options.sshRemote) {
+      for (const [k, v] of Object.entries(gatewayEnv)) env[k] = v
+    }
+
+    // The OWNING project's env (`.nodeterm/settings.json`, local overlay + TRUSTED shared half —
+    // the gate is in `makeProjectSpawnOverrides`, never here). Placed between the gateway and the
+    // custom agent on purpose: a project may point its terminals at its own tooling, and a
+    // per-agent config the user wrote for THIS agent still beats it on a key collision.
+    //
+    // LITERAL values only: no `${env:VAR}` expansion. That is a custom-agent feature and a
+    // settings.json is git-shared hostile input — expanding it would turn an approved-looking
+    // literal into a read of this machine's process environment. The keys/values are already
+    // bounded and identifier-shaped by the settings sanitizer.
+    // RESERVED KEYS are dropped here, before either leg reads `projectEnv` — one filter, applied
+    // once, so the local merge below and the ssh `remoteEnvPairs` join further down cannot drift
+    // apart. Consent is not the gate for these: it proves a human saw the pairs, not that they
+    // understood a git-shared file was out-ranking the auth-strip / account / hook layers that
+    // exist to control exactly those names. See `isReservedSpawnEnvKey`.
+    const projectEnv = overrides?.env
+      ? Object.fromEntries(
+          Object.entries(overrides.env).filter(([k]) => !isReservedSpawnEnvKey(k))
+        )
+      : undefined
+    if (!options.sshRemote && projectEnv) {
+      for (const [k, v] of Object.entries(projectEnv)) env[k] = v
+    }
+
+    // Custom-agent env: merged LAST so it wins over hook + account + PATH/LANG env (required for
+    // the proxy use case — the user's ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL must beat whatever
+    // the account path set). ${env:VAR} is expanded against the live process env. Only the LOCAL
+    // path merges into `env` here; the remote (ssh) path threads the same vars into the tmux `-e`
+    // list below (the local ssh client's env does not propagate to the remote tmux session).
+    let customEnvMerged: Record<string, string> = {}
+    if (!options.sshRemote) {
+      const custom = findCustomAgent(this.getSettings().customAgents, options.agentId ?? '')
+      const merged = applyCustomAgentEnv(env, custom, process.env as Record<string, string | undefined>)
+      for (const [k, v] of Object.entries(merged.env)) env[k] = v
+      for (const w of merged.warnings) console.warn(w)
+      customEnvMerged = merged.env
+    }
+
     const settings = this.getSettings()
     let file: string
     let args: string[]
+    // Set true only by the session-host branch below. Decides which of the two `proc =` paths
+    // runs further down — see there for why this can't just be "no local tmux was found" (a
+    // remote/ssh node must never fall into it, and neither may a node with no persistKey at all).
+    let useSessionHost = false
+    let attachExistingHost = false
+    // Unlike the installed-binary probe, this records the backend selected for THIS generation.
+    // A Windows profile may coexist with an MSYS/Cygwin tmux on PATH and must not inherit it.
+    let useLocalTmux = false
 
     // Resolve the session program. A bare 'ssh' is resolved to an absolute path because GUI
     // apps don't inherit the shell PATH; its args come from options.shellArgs.
@@ -1943,9 +2805,22 @@ export class PtyManager {
     // mutation, or the user), so an unsafe value degrades to `undefined` = the default shell —
     // never to execution. @shared/node-exec keeps foreign values out of `options.shell` in the
     // first place; this is the second layer.
-    const reqShell = safeSessionProgram(options.shell)
+    //
+    // PRECEDENCE: the NODE's own `options.shell` wins outright — it is the exec-trusted value
+    // @shared/node-exec already vouched for, and a node that names its program means it. Only when
+    // it names none does the owning project's shell apply (local overlay, or a shared value the
+    // trust gate admitted). `??` deliberately reads the node's value BEFORE validation, so an
+    // unsafe node shell degrades to the default shell rather than silently falling through to the
+    // project's — the caller asked for a specific program and did not get the project's instead.
+    // Validation covers both sources: a project settings.json is git-shared (and on an SSH project
+    // it lives on the remote HOST), i.e. exactly the foreign provenance this check exists for.
+    const reqShell = safeSessionProgram(options.shell ?? overrides?.shell)
     const program = reqShell === 'ssh' ? findSsh() ?? 'ssh' : reqShell
     const programArgs = options.shellArgs ?? []
+    // One resolver for BOTH direct node-pty and the persistent session-host backend, so the two
+    // paths cannot drift on "which shell" (see resolveLocalSessionShell).
+    const localSessionShell = resolveLocalSessionShell(program, settings.defaultShell)
+    const localSessionArgs = program ? programArgs : []
 
     // SSH project node: run `ssh -t '<remote tmux attach-or-create>'` as the PTY program. The
     // REMOTE tmux provides persistence (over the project's ControlMaster); the local PTY just
@@ -1954,6 +2829,14 @@ export class PtyManager {
     const remoteSsh = options.sshRemote && options.persistKey ? findSsh() : null
     if (options.sshRemote && options.persistKey && remoteSsh) {
       file = remoteSsh
+      // The remote twin of the local `ensureNodeToken` above: materialise THIS node's token on the
+      // host before the attach. The connect path writes one for every node the canvas had AT
+      // CONNECT; a node created afterwards would otherwise wait for the next reconnect — for a
+      // long-lived SSH project, forever — and spend that whole time on `legacy`.
+      // Fire-and-forget and fail-open by construction (see ensureRemoteNodeToken): the hook script
+      // re-reads the file at every event, so a token that lands a moment after the attach is in
+      // time for everything that matters, and one that never lands costs only the verified label.
+      ensureRemoteNodeToken(options.sshRemote.controlPath, options.persistKey)
       // Route this ssh child's agent lookups at the APP-PRIVATE ssh-agent when main is running one
       // (published via env because core cannot import main's ssh-agent.ts). Matters when the
       // ControlMaster is down: `childArgs` uses `ControlMaster=auto`, so this child authenticates
@@ -1996,6 +2879,57 @@ export class PtyManager {
         options.accountId && options.sshRemote.remoteHome
           ? accountTmuxEnvArgs(remoteAccountConfigDirAbs(options.sshRemote.remoteHome, options.accountId))
           : []
+      // Custom-agent env for a REMOTE node: expand ${env:VAR} against the LOCAL process env (the
+      // key stays local; only the resolved VALUE travels over SSH). PATH is skipped — the local
+      // machine can't see the remote box's PATH, so a locally-resolved PATH would break CLI
+      // resolution on the host (recovering it is out of scope). Applied AFTER the account env so
+      // custom env still wins, mirroring the local path.
+      const remoteCustom = findCustomAgent(this.getSettings().customAgents, options.agentId ?? '')
+      const remoteCustomEnv = customAgentEnvArgs(
+        remoteCustom,
+        process.env as Record<string, string | undefined>,
+        { skipPath: true }
+      )
+      for (const w of remoteCustomEnv.warnings) console.warn(w)
+      // Gateway + custom env VALUES never touch an argv (the old `-e KEY=VALUE` route parked the
+      // gateway API key on the local ssh client's command line for the whole session — the PR #195
+      // leak class, on the machine AND on the remote process table at creation). They ride a 0600
+      // per-session file staged over the ControlMaster; the remote command sources + deletes it,
+      // and the remote conf's `update-environment` copies the names into the session env. Gated on
+      // the validated remote $HOME and on a wired uploader — absent either, the vars are simply
+      // not delivered and the agent fails loudly in its pane (fail-open, never a fallback to argv).
+      // The project's env joins that same 0600 file — same reason, same ordering as the local leg
+      // (gateway, then project, then the custom agent's own values on top).
+      const remoteEnvPairs: Record<string, string> = { ...gatewayEnv, ...(projectEnv ?? {}) }
+      for (const kv of remoteCustomEnv.args) {
+        const eq = kv.indexOf('=')
+        if (eq > 0) remoteEnvPairs[kv.slice(0, eq)] = kv.slice(eq + 1)
+      }
+      let remoteSessionEnv: RemoteSessionEnv | undefined
+      if (
+        Object.keys(remoteEnvPairs).length &&
+        options.sshRemote.remoteHome &&
+        remoteSessionEnvAvailable()
+      ) {
+        const envFile = remoteSessionEnvPath(
+          options.sshRemote.remoteHome,
+          sessionName(options.persistKey)
+        )
+        stageRemoteSessionEnv(
+          options.sshRemote.controlPath,
+          envFile,
+          sessionEnvFileContent(remoteEnvPairs)
+        )
+        const baked = new Set<string>(MODEL_GATEWAY_ENV_KEYS)
+        remoteSessionEnv = {
+          file: envFile,
+          extraKeys: Object.keys(remoteEnvPairs).filter((k) => !baked.has(k))
+        }
+      } else if (Object.keys(remoteEnvPairs).length) {
+        console.warn(
+          '[pty] remote session env skipped (no remote home or no uploader) — agent will launch without gateway/custom env'
+        )
+      }
       args = remoteTmuxPtyArgs(
         options.sshRemote.conn,
         options.sshRemote.controlPath,
@@ -2010,8 +2944,14 @@ export class PtyManager {
         [...hookExtraEnv, ...remoteAccountEnv],
         // Source nodeterm's remote tmux.conf via `-f` (written on connect, Task 2) so a cold-start
         // session gets mouse/clipboard/scrollback. Fail-open: undefined → remote tmux host defaults.
-        options.sshRemote.tmuxConfPath
+        options.sshRemote.tmuxConfPath,
+        remoteSessionEnv
       )
+    } else if (warmWindowsBackend === 'session-host') {
+      useSessionHost = true
+      attachExistingHost = true
+      file = ''
+      args = []
     } else if (this.tmuxPath && settings.tmuxEnabled && options.persistKey) {
       // attach-or-create the persistent session for this node.
       // `-A` = attach-or-create. `-D` = detach OTHER clients on attach. We use `-D` ONLY for the
@@ -2023,6 +2963,22 @@ export class PtyManager {
       // `-e` sets the session environment explicitly (the tmux server is shared, so relying
       // on the client's inherited env would leak the first session's values into later ones).
       file = this.tmuxPath
+      useLocalTmux = true
+      if (warmWindowsBackend === 'tmux') {
+        // Attach-only is the critical distinction from `new-session -A`: if the proven warm
+        // generation disappears in this window, tmux rejects instead of cold-spawning a shell
+        // from options that deliberately skipped trusted profile resolution.
+        args = [
+          '-L',
+          TMUX_SOCKET,
+          '-f',
+          this.confPath,
+          'attach-session',
+          ...(sinks ? [] : ['-d']),
+          '-t',
+          sessionName(options.persistKey)
+        ]
+      } else {
       // The hook-server env (port/token/node id/agent id) is passed explicitly via `-e`
       // (one `-e KEY=VALUE` per key) since the shared tmux server can't rely on inherited env.
       const hookEnvArgs = Object.entries(hookEnv).flatMap(([k, v]) => ['-e', `${k}=${v}`])
@@ -2033,9 +2989,32 @@ export class PtyManager {
       // Same reasoning for LANG: force the UTF-8 locale per new session so a session created on a
       // shared/stale tmux server (started before this fix) still gets UTF-8 box-drawing.
       const langEnvArgs = env.LANG ? ['-e', `LANG=${env.LANG}`] : []
+      // And for COLORTERM: panes read the SESSION env, not the client's, so the truecolor
+      // handshake must ride `-e` to reach programs on a shared/stale server (issue #78).
+      const colortermEnvArgs = ['-e', 'COLORTERM=truecolor']
       // The account config dir must ride `-e` like the hook env: the tmux server is shared
       // and long-lived, so session env comes from creation args, not client inheritance.
       const accountEnvArgs = accountDir ? accountTmuxEnvArgs(accountDir) : []
+      // Gateway env deliberately has NO `-e` pairs: the values are in this tmux CLIENT's process
+      // environment (merged above) and the conf's `update-environment` list copies them into the
+      // session at create/attach — measured on tmux 3.4, including the removal case (a plain
+      // terminal's client lacks the vars, so tmux strips them from its session even on a server
+      // another node's env seeded). `-e KEY=VALUE` parked the API key on the long-lived attached
+      // client's argv — world-readable in /proc/<pid>/cmdline on a multi-user host, the exact
+      // PR #195 leak class. Custom-agent env keys OUTSIDE the baked gateway list still need the
+      // option appended at runtime on a shared server (the conf assignment cannot know them):
+      // The project's keys need the same treatment for the same reason: their VALUES are in this
+      // tmux client's process env (merged above) and must reach the session without ever appearing
+      // on the long-lived client's argv.
+      // The account-scope names lead the list for the LONG-LIVED server case (#419): the conf is
+      // read once at server start, so a server started by a pre-fix app keeps its old
+      // update-environment array forever — these appends are what retrofit it before this
+      // session is created. A fresh server already has them from the conf (the append dedupes).
+      this.ensureUpdateEnvKeys([
+        ...ACCOUNT_SCOPE_UPDATE_ENV,
+        ...Object.keys(customEnvMerged),
+        ...Object.keys(projectEnv ?? {})
+      ])
       const attachFlags = tmuxAttachFlags(!!sinks)
       args = [
         '-L',
@@ -2047,6 +3026,7 @@ export class PtyManager {
         ...hookEnvArgs,
         ...pathEnvArgs,
         ...langEnvArgs,
+        ...colortermEnvArgs,
         ...accountEnvArgs,
         '-c',
         cwd,
@@ -2059,35 +3039,80 @@ export class PtyManager {
         args.push(shell)
         args.push(...programArgs)
       }
+      }
+    } else if (
+      !options.sshRemote &&
+      options.persistKey &&
+      settings.tmuxEnabled &&
+      sessionHostSupported()
+    ) {
+      // `file`/`args` are left unused: the real spawn happens INSIDE the session-host process, driven by
+      // the `SessionHostPty` constructed below, not by a `pty.spawn()` in this one.
+      useSessionHost = true
+      file = ''
+      args = []
     } else {
-      file =
-        program ||
-        settings.defaultShell ||
-        process.env.SHELL ||
-        (os.platform() === 'win32' ? 'powershell.exe' : 'bash')
-      args = program ? programArgs : []
+      // `process.env.SHELL` is a POSIX-only convention (unset on Windows outside a POSIX
+      // subsystem), so it never wins the win32 branch anyway — the ordering below just says so
+      // explicitly instead of relying on it being empty there.
+      file = localSessionShell
+      args = localSessionArgs
     }
 
     let proc: pty.IPty
-    try {
-      proc = pty.spawn(file, args, {
-        name: 'xterm-256color',
-        cols: options.cols,
-        rows: options.rows,
-        cwd,
-        env
-      })
-    } catch (err) {
-      // node-pty surfaces the underlying failure as a bare "posix_spawnp failed." with no errno.
-      // Two different field causes wear that same message, so BOTH are measured before anything is
-      // said: a cross-arch `electron-builder --x64` run clobbering node-pty's spawn-helper (arm64
-      // app can't exec an x86_64 helper), and the machine being out of pty DEVICES
-      // (`kern.tty.ptmx_max`, 2026-08-11 — 515 `/dev/ttys*` against a ceiling of 511).
-      const reason = err instanceof Error ? err.message : String(err)
-      // Re-read the devices rather than reusing the pre-flight's reading: this spawn just consumed
-      // (and, per the leak above, kept) devices of its own, so the number the user is shown should
-      // be the one that was true when the failure happened.
-      throw this.spawnFailureError(reason, file, cwd, spawnHelperArchMismatch(), readPtyDevices())
+    if (useSessionHost) {
+      // Cast to the small `IPty` subset this file actually touches — see `SessionHostPty`'s own
+      // doc comment for exactly what it implements and why that is enough. Its constructor kicks
+      // off the attach-or-create round trip asynchronously and never throws synchronously (a
+      // rejection surfaces on `.ready`, awaited by `spawnNew` — see there for how a failure
+      // degrades rather than blocking the create).
+      // `resolveLocalSessionShell`, NOT a bare `|| 'bash'`.
+      //
+      // This branch exists BECAUSE the platform has no tmux — which in practice means Windows —
+      // and it was defaulting to a POSIX shell that does not exist there. The host dutifully tried
+      // to spawn `bash`, node-pty answered `File not found:`, and the attach rejected. Everything
+      // downstream then hid it: the rejection was swallowed by a bare catch, `persistent` was
+      // derived from the path chosen rather than the outcome, and the renderer fell back to a
+      // plain shell. So every terminal on Windows looked fine and silently did not survive a
+      // restart — the one thing this whole backend is for.
+      //
+      // The non-session-host branch above already resolves this correctly. Sharing that logic is
+      // the fix; two places deciding "which shell" is what let them disagree.
+      proc = (attachExistingHost
+        ? attachExistingSessionHostPty(sessionName(options.persistKey as string))
+        : createSessionHostPty(
+            sessionName(options.persistKey as string),
+            {
+              cwd,
+              shell: localSessionShell,
+              args: localSessionArgs,
+              env,
+              cols: options.cols,
+              rows: options.rows
+            },
+            settings.tmuxScrollback
+          )) as unknown as pty.IPty
+    } else {
+      try {
+        proc = pty.spawn(file, args, {
+          name: 'xterm-256color',
+          cols: options.cols,
+          rows: options.rows,
+          cwd,
+          env
+        })
+      } catch (err) {
+        // node-pty surfaces the underlying failure as a bare "posix_spawnp failed." with no errno.
+        // Two different field causes wear that same message, so BOTH are measured before anything is
+        // said: a cross-arch `electron-builder --x64` run clobbering node-pty's spawn-helper (arm64
+        // app can't exec an x86_64 helper), and the machine being out of pty DEVICES
+        // (`kern.tty.ptmx_max`, 2026-08-11 — 515 `/dev/ttys*` against a ceiling of 511).
+        const reason = err instanceof Error ? err.message : String(err)
+        // Re-read the devices rather than reusing the pre-flight's reading: this spawn just consumed
+        // (and, per the leak above, kept) devices of its own, so the number the user is shown should
+        // be the one that was true when the failure happened.
+        throw this.spawnFailureError(reason, file, cwd, spawnHelperArchMismatch(), readPtyDevices())
+      }
     }
 
     // tmux-backed sessions snapshot their scrollback to disk periodically so a machine reboot
@@ -2098,8 +3123,12 @@ export class PtyManager {
     // marked remote — otherwise destroy/capture would target a remote tmux that was never spawned
     // and silently leak the local session.
     const remote = options.sshRemote && options.persistKey && remoteSsh ? options.sshRemote : undefined
-    const tmuxBacked = !!(this.tmuxPath && settings.tmuxEnabled && options.persistKey)
-    const persisted = !!options.persistKey && (remote ? true : tmuxBacked)
+    const tmuxBacked = useLocalTmux
+    // `useSessionHost` is exactly "did the branch selection above pick the session-host backend",
+    // so it needs no re-derivation here — session-host-backed sessions survive losing their
+    // client exactly like tmux-backed ones do, for the same reason: the underlying pty lives in a
+    // separate process (the session host), not in this one.
+    const persisted = !!options.persistKey && (remote ? true : tmuxBacked || useSessionHost)
     const spawnSize = normalizeSize(options.cols, options.rows)
     // The spawning view's composite key. Usually the canvas node (PRIMARY), but a modal that opens
     // a node whose canvas terminal is closed spawns it too — under its own viewerId, correctly.
@@ -2137,7 +3166,8 @@ export class PtyManager {
       tmuxBacked: persisted,
       unwatchedSince: null,
       pausedBy: new Set<string>(),
-      accountFallback
+      accountFallback,
+      sessionHost: useSessionHost
     }
     // Both shared timers are armed by the first session that needs them: the scrollback snapshots
     // and the idle reap are both about tmux-backed sessions and nothing else.
@@ -2155,22 +3185,74 @@ export class PtyManager {
     // destroyer can even reach a spawn for a tombstoned node (create() refuses everyone else), so
     // this is exactly "the owner brought the node back" (⌘Z) — and its co-viewers must be able to
     // join the new session rather than stay refused.
-    if (session.indexKey) this.tombstones.delete(session.indexKey)
+    // A session-host record is provisional until its async attach succeeds. spawnNew() clears the
+    // tombstone after ready so a failed resurrection cannot silently remove deletion protection.
+    if (session.indexKey && !session.sessionHost) this.tombstones.delete(session.indexKey)
     // The replacement session for a RECYCLED node (worktree move) is now live and indexed, so its
     // co-viewers can safely be told to restart: their create() will `join` THIS session instead of
     // spawning `nt-<nodeId>` from their own (stale) cwd. This is the whole reason the notice waits.
-    if (session.indexKey && this.pendingRecycle.has(session.indexKey))
+    // A session-host shim is only provisional until its asynchronous `ready` settles. spawnNew()
+    // fires this notice after that barrier; publishing here would wake co-viewers onto a dead id.
+    if (session.indexKey && !session.sessionHost && this.pendingRecycle.has(session.indexKey))
       this.fireRecycled(session.indexKey, true)
 
-    proc.onData((data) => this.queueData(sessionId, session, data))
+    proc.onData((data) => {
+      // A session-host attach can fail after the shim has already delivered startup bytes. Once
+      // rollback removes this exact generation, late callbacks must not recreate its flush timer
+      // or leak bytes into a replacement that happens to reuse the same node id.
+      if (this.sessions.get(sessionId) !== session) return
+      this.queueData(sessionId, session, data)
+    })
 
     proc.onExit(({ exitCode }) => {
-      this.flush(sessionId, session) // deliver any buffered output before the exit signal
-      session.onExit?.(exitCode) // relay host sink (unchanged)
-      for (const client of this.clientsOf(session))
-        this.send(client, IPC.ptyExit(sessionId), exitCode)
-      this.forget(sessionId, session)
+      // The persistent host broadcasts exit before it answers killSession. The confirmed profile
+      // switch must await that acknowledgement before mutating the local index/subscribers, so the
+      // exact in-flight generation's early exit is consumed by the transaction instead of racing
+      // cleanup ahead of the response. Success cleans it below; rejection leaves it untouched.
+      const confirmedEnd = this.confirmedBackendEnds.get(sessionId)
+      if (confirmedEnd?.session === session) {
+        confirmedEnd.exitCode = exitCode
+        confirmedEnd.resolveExit?.()
+        return
+      }
+      this.handleSessionExit(sessionId, session, exitCode)
     })
+
+    if (useSessionHost) {
+      ;(proc as unknown as SessionHostPty).onAttachError((error) => {
+        // Reconnect replay can be rejected after this generation was already returned to the
+        // renderer. Retire only the exact remembered generation; a late callback from an older
+        // shim must never take down its replacement.
+        if (this.sessions.get(sessionId) !== session) return
+        const safeReason = /^(?:no existing session|session '[A-Za-z0-9._-]+' is ending|unauthorized|no such session)/i.test(
+          error.message
+        )
+          ? error.message
+          : 'the persistent session host rejected the reattach'
+        this.queueData(
+          sessionId,
+          session,
+          `\r\n[nodeterm] Persistent terminal reattach failed: ${safeReason}\r\n`
+        )
+        this.handleSessionExit(sessionId, session, 1)
+      })
+    }
+
+    // Detached relay callers cannot await SessionHostPty.ready because their long-standing API
+    // returns a session id synchronously. They still must not retain a zombie Session: retire it
+    // and surface an ordinary non-zero exit to the sink if the asynchronous attach fails.
+    if (useSessionHost && sinks) {
+      void (proc as unknown as SessionHostPty).ready.catch(() => {
+        if (this.sessions.get(sessionId) !== session) return
+        this.discardFailedSpawn(sessionId, session)
+        try {
+          sinks.onExit(1)
+        } catch {
+          // A consumer callback cannot resurrect the already-retired provisional Session, and a
+          // throw here must not become an unhandled rejection from this deliberately detached task.
+        }
+      })
+    }
 
     return sessionId
   }
@@ -2178,8 +3260,15 @@ export class PtyManager {
   /** Park a recycled session's co-viewers until the replacement session shows up (or the timeout
    *  fires). One entry per node: a second recycle before the first resolved supersedes it — the
    *  earlier waiters are folded in, since their session is just as dead. */
-  private armRecycle(persistKey: string, sessionId: string, clients: ClientId[]): void {
+  private armRecycle(
+    persistKey: string,
+    sessionId: string,
+    clients: ClientId[],
+    owner: ClientId | null,
+    target?: PtyRecycleTarget
+  ): void {
     const prev = this.pendingRecycle.get(persistKey)
+    const waiters = prev?.waiters ?? []
     if (prev) {
       clearTimeout(prev.timer)
       for (const c of prev.clients) clients.push(c)
@@ -2187,6 +3276,9 @@ export class PtyManager {
     this.pendingRecycle.set(persistKey, {
       sessionId,
       clients: new Set(clients),
+      owner: owner === null ? null : subKey(owner, PRIMARY_VIEWER),
+      ...(target ? { target } : {}),
+      waiters,
       timer: setTimeout(() => this.fireRecycled(persistKey, false), RECYCLE_NOTIFY_TIMEOUT_MS)
     })
   }
@@ -2215,6 +3307,15 @@ export class PtyManager {
     clearTimeout(entry.timer)
     const channel = IPC.ptyRecycled(entry.sessionId)
     for (const client of entry.clients) this.send(client, channel, { ready })
+    if (ready) {
+      // The exact replacement is registered and ready; replay each parked create through the
+      // ordinary path so it co-attaches and gets the same screen/size semantics as any joiner.
+      for (const waiter of entry.waiters)
+        void this.create(waiter.clientId, waiter.options).then(waiter.resolve, waiter.reject)
+    } else {
+      const error = new Error('The replacement terminal did not become ready. Reopen it to try again.')
+      for (const waiter of entry.waiters) waiter.reject(error)
+    }
   }
 
   /** Drop a dead/released session from both indexes. Keyed off `indexKey` (not `persistKey`,
@@ -2223,6 +3324,48 @@ export class PtyManager {
     this.sessions.delete(sessionId)
     if (session.indexKey && this.byPersistKey.get(session.indexKey) === sessionId)
       this.byPersistKey.delete(session.indexKey)
+  }
+
+  /** Apply an ordinary process exit for one exact session generation. Kept separate so a
+   * confirmed backend kill whose response is lost can replay the exit it deferred: in that case
+   * the process really ended, but the profile switch still rejects and never respawns/applies. */
+  private handleSessionExit(sessionId: string, session: Session, exitCode: number): void {
+    if (this.sessions.get(sessionId) !== session) return
+    this.flush(sessionId, session) // deliver any buffered output before the exit signal
+    session.onExit?.(exitCode) // relay host sink (unchanged)
+    for (const client of this.clientsOf(session))
+      this.send(client, IPC.ptyExit(sessionId), exitCode)
+    this.forget(sessionId, session)
+  }
+
+  /** Roll back the provisional Session installed before a session-host attach settles. Unlike a
+   * normal release, this records no shadow/released-session metadata and takes no snapshot: there
+   * was never a confirmed live session to preserve. */
+  private discardFailedSpawn(sessionId: string, session: Session): void {
+    if (session.flushTimer) {
+      clearTimeout(session.flushTimer)
+      session.flushTimer = null
+    }
+    session.buf = []
+    session.bufBytes = 0
+    session.subscribers.clear()
+    session.sizes.clear()
+    session.shown.clear()
+    session.pausedBy.clear()
+    // Do not use releasePty here: its defensive resume would issue a fresh host request from a
+    // shim whose attach just failed. SessionHostPty.destroy() is the exact detach/unsubscribe.
+    const hostPty = session.proc as unknown as SessionHostPty
+    hostPty.destroy()
+    this.forget(sessionId, session)
+    const remaining = [...this.sessions.values()]
+    if (!remaining.some((candidate) => candidate.persistKey) && this.snapshotTimer) {
+      clearInterval(this.snapshotTimer)
+      this.snapshotTimer = null
+    }
+    if (!remaining.some((candidate) => candidate.tmuxBacked) && this.reapTimer) {
+      clearInterval(this.reapTimer)
+      this.reapTimer = null
+    }
   }
 
   /**
@@ -2605,9 +3748,10 @@ export class PtyManager {
    * markdown view); otherwise the recent ~200 lines (AI naming, palette search).
    */
   async captureSession(persistKey: string, full = false): Promise<string> {
+    const live = this.liveSessionForPersistKey(persistKey)
     // Remote (ssh-project) node: there is no local tmux session — capture from the REMOTE tmux
     // over the project's ControlMaster (mirrors snapshotScrollback / destroySession).
-    const sshRemote = this.sessionByPersistKey(persistKey)?.sshRemote
+    const sshRemote = live?.sshRemote
     if (sshRemote) {
       const ssh = findSsh()
       if (!ssh) return ''
@@ -2622,7 +3766,13 @@ export class PtyManager {
         return ''
       }
     }
-    if (!this.tmuxPath) return ''
+    // Backend choice belongs to the live generation, not to whichever binaries happen to be on
+    // PATH. A native Windows profile remains session-host-backed beside an MSYS/Cygwin tmux.
+    if (live?.sessionHost || !this.tmuxPath) {
+      return this.getSettings().tmuxEnabled && sessionHostSupported()
+        ? sessionHostCapture(sessionName(persistKey), full)
+        : ''
+    }
     try {
       const { stdout } = await runAsync(
         this.tmuxPath,
@@ -2648,6 +3798,11 @@ export class PtyManager {
     if (!session) return ''
     const key = session.persistKey ?? session.indexKey
     if (!key) return ''
+    // `true` (full scrollback, same cap the emulator was built with): unlike tmux's plain-pane
+    // capture, this backend has no separate mechanism for the user to scroll a live session's
+    // history (there is no tmux underneath to own the wheel — see docs/windows-session-host.md),
+    // so a joiner is seeded generously rather than with just the visible rows.
+    if (session.sessionHost) return sessionHostCapture(sessionName(key), true)
     if (session.sshRemote) return this.captureSession(key)
     return this.captureSnapshot(key)
   }
@@ -2679,6 +3834,7 @@ export class PtyManager {
         )
         return parsePaneCursor(stdout)
       }
+      if (session.sessionHost) return undefined
       if (!this.tmuxPath) return undefined
       const { stdout } = await runAsync(this.tmuxPath, [
         '-L',
@@ -2703,7 +3859,8 @@ export class PtyManager {
    */
   private async snapshotScrollback(
     persistKey: string,
-    sshRemote?: NonNullable<PtyCreateOptions['sshRemote']>
+    sshRemote?: NonNullable<PtyCreateOptions['sshRemote']>,
+    sessionHost = false
   ): Promise<boolean> {
     if (sshRemote) {
       // Remote (ssh-project) node: capture from the REMOTE tmux over the project's ControlMaster.
@@ -2722,7 +3879,21 @@ export class PtyManager {
         return false
       }
     }
-    if (!this.tmuxPath) return false
+    // No local tmux: this is a session-host-backed session (only that backend reaches this
+    // periodic snapshot loop at all — see `snapshotTick`'s `session.persistKey` gate). Same
+    // "cold-restore across a machine reboot" purpose as the tmux capture below; see
+    // docs/windows-session-host.md §7 for the honest limitation this snapshot exists to soften
+    // (the session-host process itself does NOT survive a reboot, unlike a real tmux server).
+    if (sessionHost || !this.tmuxPath) {
+      if (!this.getSettings().tmuxEnabled || !sessionHostSupported()) return false
+      try {
+        const text = await sessionHostCapture(sessionName(persistKey), true)
+        if (text) await writeScrollback(persistKey, text)
+        return true
+      } catch {
+        return false
+      }
+    }
     try {
       const { stdout } = await runAsync(
         this.tmuxPath,
@@ -2749,50 +3920,61 @@ export class PtyManager {
    *
    * An SSH-project node has no LOCAL tmux session to target (its pty program is `ssh -t '<remote
    * attach>'`) — so if the node's LIVE session is registered with `sshRemote`, this runs the
-   * remote counterpart instead (`remoteTmuxSendKeysArgs`, over the project's ControlMaster),
+   * remote counterpart instead (`remoteTmuxPasteArgs`, over the project's ControlMaster),
    * mirroring how `remoteSessionExists` reuses `findSsh()` + `runAsync`. A node with no live
    * session at all (nothing mounted right now) still falls through to the local path and returns
    * false there, same as before this change — reaching a currently-unmounted SSH node's remote
    * session is not supported.
+   *
+   * ── DELIVERY: TMUX FRAMES THE PASTE, WE DO NOT ─────────────────────────────────────────────────
+   *
+   * Both paths are now one `tmux load-buffer - ; … ; paste-buffer -d -p -r ; send-keys Enter`
+   * invocation with the payload on STDIN. `localTmuxPasteArgs` carries the whole measurement: the
+   * old `#{bracket_paste_flag}` probe needed tmux 3.7 and, on every older tmux, quietly delivered
+   * raw newlines into the app instead of a paste; `paste-buffer -p` asks the pane itself and has
+   * done since tmux 1.7.
+   *
+   * ── WHY THIS METHOD IS ONLY A DISPATCHER ───────────────────────────────────────────────────────
+   *
+   * Everything decided per write — `sanitizePasteText`, the empty-body case, the per-call buffer
+   * name, and the buffer sweep when the paste fails — lives in `localPasteDelivery` /
+   * `remotePasteDelivery` / `runPasteDelivery`, which a real-tmux test drives DIRECTLY.
+   *
+   * That is a correction, not a preference. The first version of this change inlined those
+   * decisions here and let the test rebuild them in its own helper. Both sides were green and two
+   * mutations survived a full run: deleting the empty-body branch, and deleting the sanitize call.
+   * A test that re-implements what it is testing cannot notice the original being removed. So the
+   * composition is exported, both callers use it, and the only thing left in this method is which
+   * transport runs it.
    */
   async sendText(persistKey: string, text: string, opts?: { enter?: boolean }): Promise<boolean> {
     const enter = opts?.enter ?? true
     const target = sessionName(persistKey)
-    const sshRemote = this.sessionByPersistKey(persistKey)?.sshRemote
-    if (sshRemote) {
-      const ssh = findSsh()
-      if (!ssh) return false
-      try {
-        await runAsync(ssh, remoteTmuxSendKeysArgs(sshRemote.conn, sshRemote.controlPath, target, text, enter))
-        return true
-      } catch {
-        return false
-      }
-    }
-    if (!this.tmuxPath) return false
+    const live = this.liveSessionForPersistKey(persistKey)
+    const sshRemote = live?.sshRemote
     try {
-      if (await this.bracketPasteRequested(target)) {
-        // Paste-aware target (agent TUIs, multiplexers like herdr): one atomic write — the
-        // text framed in paste markers plus the Enter — so the composer sees a definitive
-        // paste boundary and the Enter can never be re-chunked into the paste (issue #47).
-        await runAsync(this.tmuxPath, [
-          '-L',
-          TMUX_SOCKET,
-          'send-keys',
-          '-t',
-          target,
-          '-l',
-          bracketedInjection(text, enter)
-        ])
-        return true
+      if (sshRemote) {
+        const ssh = findSsh()
+        if (!ssh) return false
+        const plan = remotePasteDelivery(sshRemote.conn, sshRemote.controlPath, target, text, enter)
+        if (!plan) return true
+        return await runPasteDelivery(plan, (args, input) => runWithStdin(ssh, args, input))
       }
-      // The literal text and the Enter (when sent) must go in order, so await sequentially.
-      await runAsync(this.tmuxPath, ['-L', TMUX_SOCKET, 'send-keys', '-t', target, '-l', text])
-      if (enter) {
-        await runAsync(this.tmuxPath, ['-L', TMUX_SOCKET, 'send-keys', '-t', target, 'Enter'])
+      // No local tmux: this machine persists sessions via the session-host backend instead (see
+      // docs/windows-session-host.md). Its `sendKeys` needs no attached client, exactly like
+      // tmux's own `send-keys -t <name>` — the host looks the session up by NAME.
+      if (live?.sessionHost || !this.tmuxPath) {
+        return this.getSettings().tmuxEnabled && sessionHostSupported()
+          ? sessionHostSendKeys(target, text, enter)
+          : false
       }
-      return true
+      const tmuxPath = this.tmuxPath
+      const plan = localPasteDelivery(TMUX_SOCKET, target, text, enter)
+      if (!plan) return true
+      return await runPasteDelivery(plan, (args, input) => runWithStdin(tmuxPath, args, input))
     } catch {
+      // Only a builder throwing (an unsafe target) reaches here — `runPasteDelivery` answers false
+      // rather than throwing, precisely so the sweep cannot be skipped by an early exit.
       return false
     }
   }
@@ -2810,7 +3992,8 @@ export class PtyManager {
    */
   async paneCommand(persistKey: string): Promise<string | null> {
     const target = sessionName(persistKey)
-    const sshRemote = this.sessionByPersistKey(persistKey)?.sshRemote
+    const live = this.liveSessionForPersistKey(persistKey)
+    const sshRemote = live?.sshRemote
     if (sshRemote) {
       const ssh = findSsh()
       if (!ssh) return null
@@ -2824,7 +4007,13 @@ export class PtyManager {
         return null
       }
     }
-    if (!this.tmuxPath) return null
+    // No local tmux: ask the session-host backend's own `#{pane_current_command}` equivalent (a
+    // descendant-process walk — see process-tree.ts for the imprecision that carries).
+    if (live?.sessionHost || !this.tmuxPath) {
+      return this.getSettings().tmuxEnabled && sessionHostSupported()
+        ? sessionHostPaneCommand(target)
+        : null
+    }
     try {
       const { stdout } = await runAsync(this.tmuxPath, [
         '-L',
@@ -2842,14 +4031,50 @@ export class PtyManager {
   }
 
   /**
-   * Did the application in this pane request bracketed-paste mode? tmux tracks the DECSET
-   * 2004 state per pane and exposes it as `bracket_paste_flag`. Unknown — query fails, old
-   * tmux without the format — reads as false, so delivery degrades to the legacy two-step
-   * path rather than sending paste markers an unaware app would render as garbage input.
+   * Terminate the foreground agent process group in a node's tmux pane without writing anything
+   * into the terminal. This is intentionally narrower than recycling the session: model switching
+   * first stops the harness by PID, then uses the existing recycle path to rebuild the shell with
+   * current gateway environment.
+   *
+   * `expectedAgentId` is the IDENTITY GATE. Refusing a shell (the old contract) is not enough: a
+   * model switch fires from a possibly-stale menu, and hours after the agent exited the pane may
+   * belong to vim, a build, or an ssh the user started — none of which should be SIGTERM'd. When an
+   * expected id is given, the foreground group's full argv is read (`paneOwner`) and the kill
+   * happens ONLY when `isAgentPane` confirms the expected harness owns the group; `not-agent` and
+   * `unknown` both refuse (fail-closed — we are about to send a signal). Omitting the id preserves
+   * the legacy shell-only guard for any caller that has no agent to assert.
    */
-  private async bracketPasteRequested(target: string): Promise<boolean> {
-    if (!this.tmuxPath) return false
+  async terminateForeground(persistKey: string, expectedAgentId?: string): Promise<boolean> {
+    if (typeof persistKey !== 'string' || !persistKey || persistKey.length > REF_MAX_LEN) return false
+    // Identity gate: prove the expected harness owns the foreground group before signalling it.
+    // `paneOwner` reads the full argv (local or over the project's ControlMaster) and is null on
+    // any uncertainty, which `isAgentPane` maps to `unknown` → refuse.
+    if (expectedAgentId) {
+      const owner = await this.paneOwner(persistKey)
+      // Pass the custom-agent list so a `custom:<uuid>` harness is verifiable by its launchCmd
+      // binary instead of collapsing to `unknown` (which would fail-closed on every model switch).
+      const binaries = binariesFor(expectedAgentId, this.getSettings().customAgents)
+      if (isAgentPane(owner, expectedAgentId, binaries) !== 'agent') return false
+    }
+    const target = sessionName(persistKey)
+    const sshRemote = this.sessionByPersistKey(persistKey)?.sshRemote
     try {
+      if (sshRemote) {
+        const ssh = findSsh()
+        if (!ssh) return false
+        const { stdout } = await runAsync(
+          ssh,
+          remotePaneProcessArgs(sshRemote.conn, sshRemote.controlPath, target)
+        )
+        const pane = parsePaneProcess(stdout)
+        if (!pane || isShellCommand(pane.command)) return false
+        await runAsync(
+          ssh,
+          remoteTerminateForegroundArgs(sshRemote.conn, sshRemote.controlPath, pane.panePid)
+        )
+        return true
+      }
+      if (!this.tmuxPath) return false
       const { stdout } = await runAsync(this.tmuxPath, [
         '-L',
         TMUX_SOCKET,
@@ -2857,12 +4082,163 @@ export class PtyManager {
         '-p',
         '-t',
         target,
-        '#{bracket_paste_flag}'
+        '#{pane_pid}|#{pane_current_command}'
       ])
-      return stdout.trim() === '1'
+      const pane = parsePaneProcess(stdout)
+      if (!pane) return false
+      const processTable = await runAsync('ps', ['-o', 'tpgid=', '-p', String(pane.panePid)])
+      const processGroup = foregroundProcessGroup(pane, processTable.stdout)
+      if (!processGroup) return false
+      process.kill(-processGroup, 'SIGTERM')
+      // Grace: give the harness a window to flush session state (transcript, --resume id) before
+      // the caller recycles the session (tmux kill-session). Poll the group with signal 0 —
+      // ESRCH means it is gone — up to ~1.5s, then return regardless (the recycle is a kill either
+      // way; this only improves resume fidelity for an agent that exits promptly on SIGTERM).
+      for (let i = 0; i < 30; i++) {
+        try {
+          process.kill(-processGroup, 0)
+        } catch {
+          break // ESRCH: the group has exited
+        }
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      return true
     } catch {
       return false
     }
+  }
+
+  /**
+   * WHO owns a node's pane right now, read from the kernel: the pane's pid and tty from tmux, then
+   * the full argv of the tty's FOREGROUND PROCESS GROUP. `paneCommand` above answers one name —
+   * `node`, for every npm-installed agent CLI — which is not enough to decide whether a message may
+   * be delivered into a pane. This is (see `src/core/agents/pane-owner.ts` for the measurement).
+   *
+   * Mirrors `paneCommand`'s dispatch exactly, including the SSH branch over the project's
+   * ControlMaster, and its failure contract exactly: no live session, no tmux, no ssh, a throw, an
+   * empty read, a `ps` that lists nothing, an unsafe tty — every one of them answers `null` rather
+   * than throwing or returning a partial object, because unknown is never evidence of a particular
+   * command. Deliberately has NO deadline of its own: the caller bounds it (`probeWithin`), the
+   * same way the restart poll bounds `paneCommand`.
+   *
+   * LOCALLY two round-trips, not one: tmux does not know the foreground process group
+   * (`#{pane_pid}` is the shell it forked, which is usually NOT in it), so the tty has to come
+   * back before `ps` can be asked about it — and two local execFiles cost nothing. The SSH leg is
+   * ONE round-trip (`remotePaneOwnerCombinedArgs`, issue #460): there each exec is an `ssh` child
+   * that outlives the caller's 2s deadline (reaped at `PROC_TIMEOUT_MS`) and becomes a full LOGIN
+   * whenever the master cannot serve a channel, so a caller that retries `unknown` on a short
+   * timer stacks them. See `agents/pane-probe.ts` for why that needs a circuit breaker rather
+   * than a shorter timeout.
+   *
+   * `remotePaneOwnerCombinedArgs` splices the session id unquoted (`-t ${sessionId}`), exactly as every
+   * sibling builder does. That is safe only because `sessionName()` sanitises to `[A-Za-z0-9_-]`
+   * before it ever gets here — the guarantee lives THERE, not in this call.
+   */
+  async paneOwner(persistKey: string): Promise<PaneOwner | null> {
+    const target = sessionName(persistKey)
+    const live = this.liveSessionForPersistKey(persistKey)
+    const sshRemote = live?.sshRemote
+    try {
+      if (sshRemote) {
+        // ONE round-trip, not two (issue #460): under a saturated or dead ControlMaster every
+        // exec silently falls back to a FULL ssh login, and two sequential fallback logins do not
+        // fit the caller's 2s probe budget — a live agent pane then read as `unknown`,
+        // persistently. The combined script carries both halves; the parser applies the same
+        // grammars the two-trip read used. See `remotePaneOwnerCombinedArgs` for the measurement.
+        const ssh = findSsh()
+        if (!ssh) return null
+        const out = await runAsync(
+          ssh,
+          remotePaneOwnerCombinedArgs(sshRemote.conn, sshRemote.controlPath, target)
+        )
+        return parseCombinedPaneOwner(out.stdout)
+      }
+      // The session host has no tty/tmux identity surface. Do not query an unrelated POSIX tmux
+      // merely because one is installed beside this native Windows generation.
+      if (live?.sessionHost || !this.tmuxPath) return null
+      const first = await runAsync(this.tmuxPath, [
+        '-L',
+        TMUX_SOCKET,
+        'display-message',
+        '-p',
+        '-t',
+        target,
+        PANE_OWNER_FMT
+      ])
+      const identity = parsePaneOwner(first.stdout)
+      if (!identity) return null
+      const call = foregroundArgvArgs(identity.tty)
+      if (!call) return null
+      const second = await runAsync(call.bin, call.args)
+      return paneOwnerFrom(identity, second.stdout)
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * DELETED: `bracketPasteRequested`.
+   *
+   * It read `#{bracket_paste_flag}`, a format that first shipped in TMUX 3.7 (2026-06-26). On
+   * every earlier tmux — Ubuntu 24.04's 3.4, 22.04's 3.2a, Debian 12/13's 3.3a/3.5a, Ubuntu
+   * 26.04's 3.6a, and whatever an SSH target happens to run — it expanded to the empty string,
+   * so the probe answered "not paste-aware" for every pane on earth and the delivery mangled
+   * every multi-line write. `paste-buffer -p` asks the pane's real state, inside tmux, with no
+   * version floor; there is nothing left for this method to be right about. Do not reintroduce
+   * it as a "capability check": on a pre-3.7 tmux it cannot distinguish "the app did not ask"
+   * from "I cannot ask", which is exactly the confusion that shipped the bug.
+   */
+
+  /**
+   * Deliver the agent-messaging envelope — PLAIN text from `deliverAgentMessage` — into a node's
+   * pane, local or SSH, through the SAME plans as `sendText` with the Enter always on: tmux frames
+   * the paste from the pane's real bracketed-paste state (`paste-buffer -p`) and the submit is a
+   * separate `send-keys Enter` in the same tmux command list.
+   *
+   * This replaced `sendFramedPayload`, which pushed a JS-composed `ESC[200~…ESC[201~\r` payload
+   * through `paste-buffer` with no `-p`: tmux ≥ 3.7 passes paste-buffer content through vis(3),
+   * which rendered that frame as literal `^[[200~` text in the composer and swallowed the submit
+   * (issue #453 — see the tombstones in tmux-naming.ts and paste-injection.ts). The plans
+   * sanitize the payload structurally (`sanitizePasteText` inside `localPasteDelivery` /
+   * `remotePasteDelivery`), which is now correct for this caller too: the envelope carries no ESC
+   * byte on purpose, and one smuggled in by a body must never reach a paste buffer.
+   *
+   * NOT `sendText` itself, because of the empty-payload contract: `sendText('', {enter:true})`
+   * means "submit whatever is composed", and a lone Enter into an agent's composer is exactly the
+   * accidental submit a messaging delivery must never perform — an empty envelope refuses here.
+   * (`buildEnvelope` can never return '', so this is a guard against a future caller, not a path.)
+   */
+  async sendEnvelope(persistKey: string, envelope: string): Promise<boolean> {
+    if (envelope.length === 0) return false
+    const target = sessionName(persistKey)
+    const sshRemote = this.sessionByPersistKey(persistKey)?.sshRemote
+    try {
+      if (sshRemote) {
+        const ssh = findSsh()
+        if (!ssh) return false
+        const plan = remotePasteDelivery(sshRemote.conn, sshRemote.controlPath, target, envelope, true)
+        if (!plan) return false
+        return await runPasteDelivery(plan, (args, input) => runWithStdin(ssh, args, input))
+      }
+      if (!this.tmuxPath) return false
+      const tmuxPath = this.tmuxPath
+      const plan = localPasteDelivery(TMUX_SOCKET, target, envelope, true)
+      if (!plan) return false
+      return await runPasteDelivery(plan, (args, input) => runWithStdin(tmuxPath, args, input))
+    } catch {
+      // A builder throwing (an unsafe target) lands here; `runPasteDelivery` itself answers false
+      // rather than throwing, so the buffer sweep is never skipped.
+      return false
+    }
+  }
+
+  /**
+   * Does a live session exist for this node in THIS process right now? The messaging delivery's
+   * `targetLive` fact — deliberately not derived from an unreadable pane (see `DeliveryRequest`):
+   * only "no session is registered" may be reported as "the node is gone".
+   */
+  hasLiveSession(persistKey: string): boolean {
+    return !!this.sessionByPersistKey(persistKey)
   }
 
   /**
@@ -2873,22 +4249,31 @@ export class PtyManager {
    * never throws.
    */
   async listNodetermSessions(): Promise<string[]> {
-    if (!this.tmuxPath) return []
-    try {
-      const { stdout } = await runAsync(this.tmuxPath, [
-        '-L',
-        TMUX_SOCKET,
-        'list-sessions',
-        '-F',
-        '#{session_name}'
-      ])
-      return stdout
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-    } catch {
-      return []
-    }
+    // The two persistence backends can legitimately coexist on Windows (native profiles in the
+    // session host, legacy/MSYS terminals in tmux). Query each independently so one unavailable
+    // backend cannot hide the other's sessions, then de-duplicate a migrated name.
+    const tmuxSessions = this.tmuxPath
+      ? runAsync(this.tmuxPath, [
+          '-L',
+          TMUX_SOCKET,
+          'list-sessions',
+          '-F',
+          '#{session_name}'
+        ])
+          .then(({ stdout }) =>
+            stdout
+              .split('\n')
+              .map((line) => line.trim())
+              .filter((line) => line.length > 0)
+          )
+          .catch(() => [] as string[])
+      : Promise.resolve([] as string[])
+    const hostSessions =
+      this.getSettings().tmuxEnabled && sessionHostSupported()
+        ? sessionHostListSessions().catch(() => [] as string[])
+        : Promise.resolve([] as string[])
+    const [tmux, host] = await Promise.all([tmuxSessions, hostSessions])
+    return [...new Set([...tmux, ...host])]
   }
 
   /**
@@ -2918,6 +4303,14 @@ export class PtyManager {
     return this.endSession(clientId, persistKey, 'delete', opts?.everySocket === true)
   }
 
+  /** Register shell cleanup after end processing (and the session-host acknowledgement). Failures are
+   *  isolated from the acknowledgement: a dead transcript tail must not turn a successful kill
+   *  into an outcome the renderer is told is unknown. */
+  onSessionEnded(listener: (persistKey: string) => void): () => void {
+    this.sessionEndedListeners.add(listener)
+    return () => this.sessionEndedListeners.delete(listener)
+  }
+
   /**
    * End a node's persistent session so the SAME node id can immediately respawn in a NEW cwd —
    * "move into worktree". The tmux kill is identical to `destroySession` (without it, the respawn's
@@ -2943,30 +4336,388 @@ export class PtyManager {
     return this.endSession(clientId, persistKey, 'recycle')
   }
 
+  /** Awaited desktop profile-switch variant of recycle. Main registers the invoke handler itself
+   * so it can release agent-tail ownership after this teardown succeeds. Keep the client-facing
+   * validation and rate budget identical to the existing fire-and-forget recycle channel. */
+  recycleSessionFromClient(
+    clientId: ClientId,
+    persistKey: string,
+    target?: PtyRecycleTarget
+  ): Promise<void> {
+    if (typeof persistKey !== 'string' || !persistKey || persistKey.length > REF_MAX_LEN) {
+      return Promise.reject(new Error('Refusing to restart terminal: invalid node id.'))
+    }
+    if (this.confirmedRecycles.has(persistKey)) {
+      return Promise.reject(
+        new Error('This terminal is already restarting. Wait for that restart to finish.')
+      )
+    }
+    if (!this.allowEnd(clientId, IPC.ptyRecycleConfirmed)) {
+      return Promise.reject(
+        new Error('Too many terminal restart requests. Wait a moment and try again.')
+      )
+    }
+    const operation = this.confirmAndRecycleSession(clientId, persistKey, target)
+    this.confirmedRecycles.set(persistKey, operation)
+    return operation.finally(() => {
+      if (this.confirmedRecycles.get(persistKey) === operation)
+        this.confirmedRecycles.delete(persistKey)
+    })
+  }
+
+  /** Confirm the target profile is spawnable before ending the old generation, then tear down the
+   * backend transactionally. Actual spawn resolves the stable id again at point of use: preflight
+   * prevents a knowingly destructive switch, but never turns executable/argv into persisted state. */
+  private async confirmAndRecycleSession(
+    clientId: ClientId,
+    persistKey: string,
+    target?: PtyRecycleTarget
+  ): Promise<void> {
+    let trustedTarget: PtyRecycleTarget | undefined
+    if (target) {
+      // Profile-switch replacement targets land with the windows-terminal-profiles phase; until
+      // then a target can only be refused (the same copy the fork uses without a resolver).
+      throw new Error('Windows terminal profiles are unavailable on this host.')
+    }
+    const liveId = this.byPersistKey.get(persistKey)
+    const live = this.liveSessionForPersistKey(persistKey)
+    if (live?.sshRemote) {
+      throw new Error('Remote terminals cannot be restarted with a local Windows profile.')
+    }
+    const liveSessionId = live
+      ? liveId ?? [...this.sessions.entries()].find(([, session]) => session === live)?.[0]
+      : undefined
+    let resolveExit: (() => void) | undefined
+    const exited = new Promise<void>((resolve) => {
+      resolveExit = resolve
+    })
+    const deferred:
+      | { session: Session; exitCode?: number; resolveExit?: () => void }
+      | undefined = liveSessionId && live ? { session: live, resolveExit } : undefined
+    // Install the exact-generation barrier before any awaited backend probe. A silent plain
+    // process can exit while has-session is in flight; if that natural exit were published first,
+    // the rest of this transaction would retain a stale pid and could reject after trying to kill
+    // a generation that is already gone. The barrier records that exit as proof without allowing a
+    // replacement generation to be confused with this one.
+    if (liveSessionId && deferred) this.confirmedBackendEnds.set(liveSessionId, deferred)
+    const clearExactBarrier = (): void => {
+      if (liveSessionId && this.confirmedBackendEnds.get(liveSessionId) === deferred)
+        this.confirmedBackendEnds.delete(liveSessionId)
+    }
+    const abandonConfirmedRecycle = (error: unknown): never => {
+      clearExactBarrier()
+      // A failed transaction may still have observed the exact local painter exit. Retire that
+      // dead generation honestly, but do not apply/spawn the selected profile without every
+      // persistent-backend proof (and, for a hosted replacement, its host-granted lease).
+      if (liveSessionId && deferred?.exitCode !== undefined)
+        this.handleSessionExit(liveSessionId, deferred.session, deferred.exitCode)
+      throw error
+    }
+    let confirmedSessionHost = false
+    let confirmedTmux = false
+    const settings = this.getSettings()
+    const hostAvailable = sessionHostSupported()
+    // A local index identifies one painter, not every persistent backend that may still own this
+    // node name. Migration and setting changes can leave a same-name host + tmux generation, so
+    // probe both independently even while one local generation is indexed. Failed reads remain
+    // uncertainty and reject before any destructive action. Old tmux discovery intentionally does
+    // not respect today's tmuxEnabled value: disabling persistence cannot make yesterday's live
+    // process disappear.
+    try {
+      if (hostAvailable) {
+        confirmedSessionHost = await sessionHostHasSession(sessionName(persistKey))
+      }
+      if (this.tmuxPath) confirmedTmux = await this.confirmedTmuxSessionExists(persistKey)
+    } catch (error) {
+      abandonConfirmedRecycle(
+        error instanceof SessionHostProtocolCompatibilityError
+          ? error
+          : new Error(
+              `Could not confirm the terminal session before restarting it: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            )
+      )
+    }
+
+    // The confirmed path is transactional at the app boundary: acknowledge the persistent
+    // backend kill before dropping the local index/subscribers or publishing recycle state. If the
+    // kill rejects, every local mapping remains untouched and main cannot release agent tails or
+    // let the renderer apply the new profile. Legacy fire-and-forget recycle keeps its historical
+    // cleanup-first behavior through endSession's default parameter.
+    const sourceSessionHost = !!live?.sessionHost || confirmedSessionHost
+    const sourceTmux =
+      confirmedTmux || (!!live?.tmuxBacked && !live.sessionHost && !live.sshRemote)
+    // These flags describe independent old backends, not one preferred winner. In particular, a
+    // discovered hidden host/tmux generation must not make an indexed direct PTY stop being plain:
+    // dropping that local mapping without taskkill/onExit proof leaks the silent process.
+    const sourcePlain = !!live && !live.sessionHost && !live.tmuxBacked && !live.sshRemote
+    // This is a TARGET lease, not an old-backend property. Acquire it before touching tmux/plain
+    // so another app cannot create the name in the gap, and take it exactly when the REPLACEMENT
+    // generation will be host-backed — the same predicate spawnSession's backend selection uses:
+    // on Windows whenever persistence is on and the host bundle exists, elsewhere only when no
+    // local tmux is installed (with a tmux present, the replacement lands on tmux and holds no
+    // host lease). A direct replacement deliberately holds no host lease, while old host/tmux
+    // duplicates are still ended below.
+    const reserveHostReplacement =
+      (this.runtimePlatform === 'win32' || !this.tmuxPath) &&
+      settings.tmuxEnabled &&
+      hostAvailable
+    const hostName = sessionName(persistKey)
+    const expectHostAbsent =
+      reserveHostReplacement && !live?.sessionHost && !confirmedSessionHost
+    const confirmedHostKillOptions = {
+      reserveReplacement: reserveHostReplacement,
+      requireV2: true,
+      ...(expectHostAbsent ? { expectedAbsent: true } : {})
+    }
+
+    // Host FIRST. The target lease protects the name across app processes before any old
+    // tmux/plain teardown begins. Every confirmed profile recycle requires protocol-v2 exact
+    // generation semantics, even when the selected replacement is deliberately direct and needs
+    // no lease. Generic delete remains the separate, legacy-compatible path in endSession().
+    if (reserveHostReplacement || sourceSessionHost) {
+      try {
+        await sessionHostKillSession(hostName, confirmedHostKillOptions)
+      } catch (error) {
+        if (error instanceof SessionHostProtocolCompatibilityError)
+          abandonConfirmedRecycle(error)
+
+        const exactHostExit = !!live?.sessionHost && deferred?.exitCode !== undefined
+        if (reserveHostReplacement) {
+          // An exact v2 exit proves teardown, not lease ownership. Retry the SAME retained client
+          // operation and require a host-returned token. For an unindexed host whose response was
+          // lost, a strict absence probe permits the same retry; a competing client still cannot
+          // synthesize ownership because its operation id is different and the host rejects it.
+          let mayRetryRetainedOperation = exactHostExit
+          if (!mayRetryRetainedOperation) {
+            try {
+              mayRetryRetainedOperation = !(await sessionHostHasSession(hostName))
+            } catch (probeError) {
+              abandonConfirmedRecycle(probeError)
+            }
+          }
+          if (mayRetryRetainedOperation) {
+            try {
+              await sessionHostKillSession(hostName, {
+                reserveReplacement: true,
+                requireV2: true,
+                ...(expectHostAbsent ? { expectedAbsent: true } : {})
+              })
+            } catch (leaseError) {
+              abandonConfirmedRecycle(leaseError)
+            }
+          } else {
+            abandonConfirmedRecycle(error)
+          }
+        } else {
+          // Direct targets hold no replacement lease, but they still require the correlated v2
+          // operation result so the client can retire its reconnect/kill barrier. Exact local exit
+          // proves backend death; for an unindexed host, first require strict named absence. Then
+          // retry the SAME retained non-reserve operation and wait for its idempotent result.
+          if (!exactHostExit) {
+            let hostStillExists = true
+            try {
+              hostStillExists = await sessionHostHasSession(hostName)
+            } catch (probeError) {
+              abandonConfirmedRecycle(probeError)
+            }
+            if (hostStillExists) abandonConfirmedRecycle(error)
+          }
+          try {
+            await sessionHostKillSession(hostName, confirmedHostKillOptions)
+          } catch (retryError) {
+            abandonConfirmedRecycle(retryError)
+          }
+        }
+      }
+    }
+
+    // Tmux SECOND and independently. A tmux client exit is not pane/session death proof; only the
+    // named-session kill acknowledgement or a strict absent re-probe lets this stage commit.
+    if (sourceTmux && this.tmuxPath) {
+      try {
+        await this.confirmedProcessRun(
+          this.tmuxPath,
+          localTmuxKillArgs(TMUX_SOCKET, hostName)
+        )
+      } catch (error) {
+        let tmuxStillExists = true
+        try {
+          tmuxStillExists = await this.confirmedTmuxSessionExists(persistKey)
+        } catch (probeError) {
+          abandonConfirmedRecycle(probeError)
+        }
+        if (tmuxStillExists) abandonConfirmedRecycle(error)
+      }
+    }
+
+    // Plain LAST and independently from hidden persistent backends. A natural exact exit recorded
+    // during the earlier probes is already proof, so never taskkill its stale pid. On Windows a
+    // successful process-tree termination is stronger than node-pty's sometimes-missed callback;
+    // elsewhere/no pid, bound the wait for this exact generation's exit.
+    if (sourcePlain && live && deferred?.exitCode === undefined) {
+      try {
+        releasePty(live.proc as ReleasablePty)
+        const pid = (live.proc as pty.IPty & { pid?: number }).pid
+        if (this.runtimePlatform === 'win32' && Number.isSafeInteger(pid) && (pid as number) > 0) {
+          await terminateWindowsProcessTree(pid as number)
+        } else if (deferred?.exitCode === undefined) {
+          let timeout: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([
+              exited,
+              new Promise<never>((_, reject) => {
+                timeout = setTimeout(
+                  () =>
+                    reject(
+                      new Error(
+                        'The terminal process did not confirm that it exited. Try the restart again.'
+                      )
+                    ),
+                  CONFIRMED_PLAIN_EXIT_TIMEOUT_MS
+                )
+              })
+            ])
+          } finally {
+            if (timeout) clearTimeout(timeout)
+          }
+        }
+      } catch (error) {
+        // For a plain generation, this exact callback is destructive commit proof even when the
+        // release/taskkill acknowledgement failed. Suppress ordinary ptyExit only if all hidden
+        // host/tmux stages above also committed; otherwise abandonConfirmedRecycle handled it.
+        if (deferred?.exitCode === undefined) abandonConfirmedRecycle(error)
+      }
+    }
+
+    clearExactBarrier()
+    // Every applicable backend was either ended above or strictly probed absent. Do not fall back
+    // to endSession's legacy best-effort kill (which swallows ambiguity and carries no lease).
+    await this.endSession(clientId, persistKey, 'recycle', false, true, trustedTarget)
+  }
+
   /**
    * The shared teardown behind `destroySession` / `recycleSession`: drop the session (and its
    * co-attach index entry, in-flight create, buffered output, flow-control ledger), drop the
    * cold-restore snapshot, and `tmux kill-session`. Everything the two intents disagree about is
    * the ONE branch below — what the other subscribers are told (see `EndIntent`).
    */
-  private async endSession(
+  private endSession(
     clientId: ClientId | null,
     persistKey: string,
     intent: EndIntent,
-    everySocket = false
+    everySocket = false,
+    /** The awaited confirmed-recycle path already received every backend acknowledgement. */
+    backendAlreadyEnded = false,
+    /** Trusted replacement identity; present only after confirmed profile preflight. */
+    replacementTarget?: PtyRecycleTarget
+  ): Promise<void> {
+    const current = this.ending.get(persistKey)
+    if (current) {
+      // Identical repeats share one acknowledgement only when the in-flight target scope covers
+      // this caller. An every-socket request, a pre-confirmed backend outcome, and an exact profile
+      // reservation are each stronger than their generic counterpart, so a stronger request waits
+      // for the narrow pass and then performs its own cleanup/reservation before it may resolve.
+      const targetCovered =
+        !replacementTarget ||
+        (current.replacementTarget?.profileId === replacementTarget.profileId &&
+          current.replacementTarget.cwd === replacementTarget.cwd)
+      const covered =
+        current.intent === intent &&
+        (!everySocket || current.everySocket) &&
+        (!backendAlreadyEnded || current.backendAlreadyEnded) &&
+        targetCovered
+      return covered
+        ? current.promise
+        : current.promise.then(() =>
+            this.endSession(
+              clientId,
+              persistKey,
+              intent,
+              everySocket,
+              backendAlreadyEnded,
+              replacementTarget
+            )
+          )
+    }
+    const promise = this.runEndSession(
+      clientId,
+      persistKey,
+      intent,
+      everySocket,
+      backendAlreadyEnded,
+      replacementTarget
+    )
+    const entry = { intent, everySocket, backendAlreadyEnded, replacementTarget, promise }
+    this.ending.set(persistKey, entry)
+    const clear = (): void => {
+      if (this.ending.get(persistKey) === entry) this.ending.delete(persistKey)
+    }
+    promise.then(clear, clear)
+    return promise
+  }
+
+  private async runEndSession(
+    clientId: ClientId | null,
+    persistKey: string,
+    intent: EndIntent,
+    everySocket = false,
+    /** The awaited confirmed-recycle path already received a backend kill acknowledgement. */
+    backendAlreadyEnded = false,
+    /** Trusted replacement identity; present only after confirmed profile preflight. */
+    replacementTarget?: PtyRecycleTarget
   ): Promise<void> {
     // Both callers run while the session is still live, so its sshRemote is known. Capture it
     // synchronously before any await. The index is the co-attach one (UI sessions); the scan is
     // the fallback for a session that is live but not indexed.
-    const dyingId = this.byPersistKey.get(persistKey)
-    const dying = dyingId ? this.sessions.get(dyingId) : undefined
-    const sshRemote = dying?.sshRemote ?? this.sessionByPersistKey(persistKey)?.sshRemote
+    const indexedId = this.byPersistKey.get(persistKey)
+    const indexed = indexedId ? this.sessions.get(indexedId) : undefined
+    const fallback = indexed ?? this.sessionByPersistKey(persistKey)
+    const dyingId =
+      indexedId ??
+      (fallback
+        ? [...this.sessions.entries()].find(([, candidate]) => candidate === fallback)?.[0]
+        : undefined)
+    const dying = fallback
+    const sshRemote = dying?.sshRemote
+    // SessionHostClient has a real request/response acknowledgement. Await it BEFORE any local
+    // deletion claim: on transport failure the node, tombstone, subscribers and transcript tails
+    // remain available, because the host outcome is unknown and the user must be able to retry.
+    // A live session records its backend directly; the second branch preserves the old unheld-row
+    // behavior, where the enabled host may own a session this manager is not attached to.
+    if (backendAlreadyEnded) {
+      // The confirmed profile-switch transaction proved every applicable backend ended (or was
+      // strictly absent), so it also resolves any older generic request whose response was lost.
+      this.unknownEnds.delete(persistKey)
+    } else {
+      const sessionHostKill =
+        dying?.sessionHost === true ||
+        this.unknownEnds.has(persistKey) ||
+        (!dying &&
+          !this.tmuxPath &&
+          this.getSettings().tmuxEnabled &&
+          sessionHostSupported())
+      if (sessionHostKill) {
+        try {
+          await sessionHostKillSession(sessionName(persistKey))
+          this.unknownEnds.delete(persistKey)
+        } catch (error) {
+          this.unknownEnds.add(persistKey)
+          throw error
+        }
+      }
+    }
     // Un-index NOW (synchronously): this session is finished either way, so a create() that races
     // the kill-session below — the worktree-move respawn does exactly that — must spawn a fresh
     // session instead of co-attaching to the one we are about to end.
     // Also drop any in-flight create for this node: a create racing the kill-session below must
     // spawn a fresh session, not await (and then join) the one we are ending.
     this.inflight.delete(persistKey)
+    // The session is ending (delete or recycle), so its pane ownership no longer holds — a later
+    // genuine respawn re-records it; until then the id is unproven, which fails closed for
+    // messaging (agents/pane-ownership.ts). Safe on either intent: recycle's respawn overwrites.
+    forgetPaneOwner(persistKey)
     // The tmux session is about to be killed, so everything attached to it goes now: a shadow would
     // otherwise linger until tmux dropped its client, and what we remembered about the released
     // session describes a pane that is about to stop existing.
@@ -2992,8 +4743,8 @@ export class PtyManager {
       if (intent === 'delete') {
         const channel = IPC.ptyClosed(dyingId)
         for (const client of others) this.send(client, channel, { by: clientId })
-      } else if (others.length > 0) {
-        this.armRecycle(persistKey, dyingId, others)
+      } else {
+        this.armRecycle(persistKey, dyingId, others, clientId, replacementTarget)
       }
       // Tear the session down HERE rather than leaving it to the client's own `kill` / the pty's
       // onExit: with N subscribers there is no single kill to wait for, and every one of them may
@@ -3013,6 +4764,11 @@ export class PtyManager {
       releasePty(dying.proc as ReleasablePty)
       this.forget(dyingId, dying)
     }
+    // Confirmed absence and a solo live session still need an owner reservation: an inactive
+    // co-viewer can issue create during kill → settings-apply even when there were no subscribers
+    // to notify. It waits on this entry and can never establish a stale replacement generation.
+    if (intent === 'recycle' && (!dyingId || !dying))
+      this.armRecycle(persistKey, '', [], clientId, replacementTarget)
     // This session is gone for good — drop its cold-restore snapshot too. A recycle drops it as
     // well (and always did, when the worktree move went through `destroy`): the snapshot is of the
     // OLD cwd's session, and the respawn is a cold start (`fresh`), so replaying it would paint the
@@ -3027,39 +4783,78 @@ export class PtyManager {
     // re-binds a record immediately. Worth stating because the two intents share this line: only
     // `delete` means "gone for good".
     forgetCodexThreadIdentitiesForNode(persistKey)
-    if (sshRemote) {
-      // Remote (ssh-project) node: end the REMOTE session.
-      const ssh = findSsh()
-      if (ssh) {
-        try {
-          await runAsync(ssh, remoteTmuxKillArgs(sshRemote.conn, sshRemote.controlPath, sessionName(persistKey)))
-        } catch {
-          // remote session may not exist / master down; ignore
+    // The node's per-node capability goes with it — but ONLY on a delete, unlike the two above.
+    // The token is derived from the NODE id, and a recycle keeps the node: the file on disk stays
+    // exactly correct across a worktree move, so sweeping it would delete a valid credential and
+    // open a window (kill → respawn → first hook event) in which the node cannot prove itself.
+    // Under the trust-on-first-proof latch that window is not merely a downgrade to `legacy` — a
+    // node that has already proven itself and then presents nothing is refused. Re-minting right
+    // after the sweep would close most of it, but it depends on respawn ordering and still leaves a
+    // gap; not sweeping leaves none, and there is nothing stale to clean up.
+    if (intent === 'delete') sweepNodeToken(persistKey)
+    // The node's agent-status goes with it — and, like the token, ONLY on a delete: a RECYCLE keeps
+    // the node (the worktree move replaces this session, and the respawned agent re-asserts state
+    // onto the SAME entry), so clearing there would blank a live badge and end a Live Activity for
+    // a node that is still on the canvas.
+    //
+    // Deleting a node used to tell the mirror nothing at all — `clearNode` had no production caller
+    // — so the surfaces the mirror feeds kept rendering a node that no longer exists: the notch HUD
+    // held its needs-you/done row until the 6 h prune (its title collapsing to the literal
+    // 'Session' once the entry behind it aged out), the phone's Inbox cards for it were never
+    // resolved, and its Live Activity was never ended.
+    //
+    // Wired HERE rather than in each shell's `pty:destroy` listener because this is the one core
+    // chokepoint every permanent delete funnels through (wire handler → endFromClient → endSession,
+    // plus the internal `destroySession`), and both shells register it via `registerIpc()`. The
+    // shells' own listeners are the wrong seam twice over: they are registered for `pty:recycle`
+    // too, and there are two of them to keep in step.
+    if (intent === 'delete') clearNodeAgentStatus(persistKey)
+    if (!backendAlreadyEnded) {
+      if (sshRemote) {
+        // Remote (ssh-project) node: end the REMOTE session.
+        const ssh = findSsh()
+        if (ssh) {
+          try {
+            await runAsync(ssh, remoteTmuxKillArgs(sshRemote.conn, sshRemote.controlPath, sessionName(persistKey)))
+          } catch {
+            // remote session may not exist / master down; ignore
+          }
+        }
+        // ...and then fall through to the LOCAL kill below rather than returning. A remote node
+        // normally has no local session — but it may have one from before `requireRemote`, when a
+        // create issued with the master down spawned a local shell under this exact name. That
+        // orphan outlived everything (this branch used to return here, so the delete never reached
+        // it) with whatever the node had launched still running in it. The node is being deleted:
+        // anything wearing its name goes with it. Costs one `kill-session` that usually says "no
+        // such session", which is already the ignored case below.
+      }
+      if (this.tmuxPath) {
+        // Which socket(s) to aim at. Holding the session ourselves means we KNOW: it is the local one,
+        // one kill, unchanged. Holding nothing means the name is all we have — and then the fan-out
+        // is the CALLER's to ask for, because on this machine a `nt-<id>` we hold nothing for can
+        // also be living on the `nodeterm-rmt` socket, where ANOTHER machine's nodeterm puts the
+        // sessions it SSHes in to spawn. Only the session-memory panel's speculative kill sets
+        // `everySocket`: it sweeps both sockets and offers to end what it found, so a kill that only
+        // tried `node-terminal` showed a confirm saying "this stops its tmux session" and did
+        // nothing. An ordinary node-× on a node never mounted in this process takes the same unheld
+        // branch and must NOT inherit that blast radius.
+        for (const socket of localKillSockets(dying ? TMUX_SOCKET : null, everySocket)) {
+          try {
+            await runAsync(this.tmuxPath, localTmuxKillArgs(socket, sessionName(persistKey)))
+          } catch {
+            // session may not exist on this socket; ignore
+          }
         }
       }
-      // ...and then fall through to the LOCAL kill below rather than returning. A remote node
-      // normally has no local session — but it may have one from before `requireRemote`, when a
-      // create issued with the master down spawned a local shell under this exact name. That
-      // orphan outlived everything (this branch used to return here, so the delete never reached
-      // it) with whatever the node had launched still running in it. The node is being deleted:
-      // anything wearing its name goes with it. Costs one `kill-session` that usually says "no
-      // such session", which is already the ignored case below.
     }
-    if (!this.tmuxPath) return
-    // Which socket(s) to aim at. Holding the session ourselves means we KNOW: it is the local one,
-    // one kill, unchanged. Holding nothing means the name is all we have — and then the fan-out is
-    // the CALLER's to ask for, because on this machine a `nt-<id>` we hold nothing for can also be
-    // living on the `nodeterm-rmt` socket, where ANOTHER machine's nodeterm puts the sessions it
-    // SSHes in to spawn. Only the session-memory panel's speculative kill sets `everySocket`: it
-    // sweeps both sockets and offers to end what it found, so a kill that only tried
-    // `node-terminal` showed a confirm saying "this stops its tmux session" and did nothing. An
-    // ordinary node-× on a node never mounted in this process takes the same unheld branch and
-    // must NOT inherit that blast radius.
-    for (const socket of localKillSockets(dying ? TMUX_SOCKET : null, everySocket)) {
+    for (const listener of this.sessionEndedListeners) {
       try {
-        await runAsync(this.tmuxPath, localTmuxKillArgs(socket, sessionName(persistKey)))
-      } catch {
-        // session may not exist on this socket; ignore
+        listener(persistKey)
+      } catch (error) {
+        console.warn(
+          `[pty] confirmed ${intent} cleanup for ${persistKey} failed`,
+          error instanceof Error ? error.message : String(error)
+        )
       }
     }
   }
@@ -3086,7 +4881,9 @@ export class PtyManager {
       // Final scrollback snapshot on quit so a reboot can replay it. Skipped for sessions with
       // no output since the last periodic capture (unchanged pane content).
       if (session.persistKey && session.outputSinceSnapshot)
-        finals.push(this.snapshotScrollback(session.persistKey, session.sshRemote))
+        finals.push(
+          this.snapshotScrollback(session.persistKey, session.sshRemote, !!session.sessionHost)
+        )
       releasePty(session.proc as ReleasablePty)
     }
     // Shadows are child processes of OURS, so quitting takes them with us — the tmux sessions they
@@ -3099,12 +4896,20 @@ export class PtyManager {
     this.byPersistKey.clear()
     // Pending recycle notices die with the sessions they were waiting on (their timers would
     // otherwise fire into a manager that has released everything).
-    for (const entry of this.pendingRecycle.values()) clearTimeout(entry.timer)
+    for (const entry of this.pendingRecycle.values()) {
+      clearTimeout(entry.timer)
+      const error = new Error('Terminal manager shut down before the replacement became ready.')
+      for (const waiter of entry.waiters) waiter.reject(error)
+    }
     this.pendingRecycle.clear()
     // Clear the in-flight index with the other two, or a create still spawning at quit would leave
     // a promise (and the session it resolves to) reachable from a manager that has released
     // everything else — a later create would then co-attach to a session we already let go.
     this.inflight.clear()
+    this.confirmedBackendEnds.clear()
+    this.confirmedRecycles.clear()
+    this.ending.clear()
+    this.unknownEnds.clear()
     return Promise.all(finals).then(() => undefined)
   }
 

@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react'
+import { Handle, Position, type NodeProps } from '@xyflow/react'
+import { NODE_MIN_SIZES } from '../lib/nodeSizing'
+import { MatchSizeNodeResizer } from '../canvas/MatchSizeNodeResizer'
 import type { CanvasNode } from '../state/workspace'
 import { useAgentNodes } from '../state/agentNodes'
 
@@ -59,7 +61,7 @@ export function SubagentNode({ id, data, selected }: NodeProps<CanvasNode>) {
 
   return (
     <div onPointerDownCapture={select} className={`subagent-node${working ? ' working' : ' done'}`}>
-      <NodeResizer isVisible={selected} minWidth={180} minHeight={84} color="#d97757" />
+      <MatchSizeNodeResizer nodeId={id} isVisible={selected} minWidth={180} minHeight={84} color="#d97757" />
       <Handle type="target" position={Position.Top} isConnectable={false} />
       <div className="subagent-node__head nodrag" onClick={toggle} style={{ cursor: 'pointer' }}>
         <button

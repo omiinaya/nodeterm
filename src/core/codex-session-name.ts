@@ -13,15 +13,20 @@
  * cannot read means the node keeps its own title, and a thread we cannot start means the launcher
  * falls back to plain codex.
  */
+import { createHash } from 'crypto'
+import { readFileSync } from 'fs'
 import { homedir } from 'os'
 import path from 'path'
 import { WebSocket } from 'ws'
 // Minting a thread is a multi-step conversation with a typically COLD server, so it needs a real
 // budget — and the hook route serving it must raise its socket guard to match (handleCodexThread).
 // Shared with the launcher's client budget so the two cannot drift apart.
-import { CODEX_THREAD_START_TIMEOUT_MS } from './codex-identity-proxy'
+// `isSafeThreadId` comes from the same module, and deliberately: this file used to keep its own
+// copy of the bare charset, which accepted `.` and `..` — harmless over the RPC wire here, but the
+// ids it validates (a thread the app-server just minted, one a node persisted) are handed straight
+// to the record store, where they ARE path segments. One rule, so the two cannot drift apart.
+import { CODEX_THREAD_START_TIMEOUT_MS, isSafeThreadId } from './codex-identity-proxy'
 
-const SAFE_THREAD_ID = /^[A-Za-z0-9._-]+$/
 /**
  * `codex app-server daemon start` exiting 0 does NOT mean its control socket is accepting
  * connections yet — the daemon binds a beat later. Everything here runs immediately after that
@@ -110,7 +115,7 @@ export function readCodexSessionNameAt(
   threadId: string,
   timeoutMs = REQUEST_TIMEOUT_MS
 ): Promise<string | null> {
-  if (!SAFE_THREAD_ID.test(threadId)) return Promise.resolve(null)
+  if (!isSafeThreadId(threadId)) return Promise.resolve(null)
   return new Promise((resolve) => {
     let settled = false
     let ws: WebSocket
@@ -271,7 +276,7 @@ export async function codexThreadExistsAt(
   attempts = SOCKET_WAIT_ATTEMPTS,
   gapMs = SOCKET_WAIT_MS
 ): Promise<boolean> {
-  if (!SAFE_THREAD_ID.test(threadId)) return false
+  if (!isSafeThreadId(threadId)) return false
   for (let i = 0; i < attempts; i++) {
     const result = await probeCodexThread(socketPath, threadId, timeoutMs)
     if (result !== 'unreachable') return result === 'yes'
@@ -403,7 +408,7 @@ function startCodexThreadOnce(
         if (
           message.error ||
           typeof startedThreadId !== 'string' ||
-          !SAFE_THREAD_ID.test(startedThreadId)
+          !isSafeThreadId(startedThreadId)
         ) {
           finish(new Error('Codex app-server returned no valid thread identity'))
           return
@@ -412,7 +417,7 @@ function startCodexThreadOnce(
         ws.send(JSON.stringify({ id: 3, method: 'turn/start', params: { threadId, input: [] } }))
       } else if (message.id === 3) {
         const turnId = message.result?.turn?.id
-        if (message.error || typeof turnId !== 'string' || !SAFE_THREAD_ID.test(turnId)) {
+        if (message.error || typeof turnId !== 'string' || !isSafeThreadId(turnId)) {
           finish(new Error('Codex app-server could not materialize the new thread'))
           return
         }
@@ -451,7 +456,7 @@ function startCodexThreadOnce(
         if (
           message.error ||
           typeof readyThreadId !== 'string' ||
-          !SAFE_THREAD_ID.test(readyThreadId)
+          !isSafeThreadId(readyThreadId)
         ) {
           finish(new Error('Codex app-server could not clean up thread materialization'))
           return
@@ -477,21 +482,206 @@ export function startCodexThread(cwd: string): Promise<string> {
 }
 
 /**
+ * The relay's on-disk fallback for a session name the shared app-server no longer reports.
+ *
+ * A native in-TUI `/resume` can fork a cloud conversation into a local app-server thread whose
+ * `Thread.name` is `null`; the persistent relay observed the source id at bind time and copied its
+ * `session_index` title to `~/.nodeterm/codex-thread-names/<sha256(socket)[..16]>/<threadId>` (the
+ * exact path the relay daemon's `nameFile` writes — one definition, kept in step). Read as DATA and
+ * capped; a later real `Thread.name` from the server always wins. Fails to `null`.
+ */
+export function relayedCodexSessionName(
+  socketPath: string,
+  threadId: string,
+  home = homedir()
+): string | null {
+  if (!isSafeThreadId(threadId)) return null
+  try {
+    const scope = createHash('sha256').update(socketPath).digest('hex').slice(0, 16)
+    const value = readFileSync(
+      path.join(home, '.nodeterm', 'codex-thread-names', scope, threadId),
+      'utf8'
+    ).trim()
+    return value ? value.slice(0, 500) : null
+  } catch {
+    return null
+  }
+}
+
+/** Seed the in-process name cache from a name observed elsewhere (e.g. a relay bind), so the next
+ * sweep serves it without a socket round-trip. A blank name caches an explicit `null`. */
+export function rememberCodexSessionName(
+  threadId: string,
+  name: unknown,
+  socketPath = defaultCodexAppServerSocket()
+): void {
+  if (!isSafeThreadId(threadId)) return
+  const value = typeof name === 'string' && name.trim() ? name.trim() : null
+  names.set(`${socketPath}\0${threadId}`, { name: value, at: Date.now() })
+}
+
+/** Read a thread's full identity from an app-server socket: its id (must come back UNCHANGED), name,
+ * and absolute rollout path. Used by the cross-account switch to locate a foreign rollout. Fails to
+ * `null` rather than throwing into a poll loop. */
+export function readCodexThreadAt(
+  socketPath: string,
+  threadId: string,
+  timeoutMs = REQUEST_TIMEOUT_MS
+): Promise<{ id: string; name: string | null; path: string | null } | null> {
+  if (!isSafeThreadId(threadId)) return Promise.resolve(null)
+  return new Promise((resolve) => {
+    let settled = false
+    let ws: WebSocket
+    const finish = (value: { id: string; name: string | null; path: string | null } | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try {
+        ws.close()
+      } catch {
+        /* the connection may never have opened */
+      }
+      resolve(value)
+    }
+    const timer = setTimeout(() => finish(null), timeoutMs)
+    timer.unref?.()
+    try {
+      ws = connectCodexAppServer(socketPath)
+    } catch {
+      clearTimeout(timer)
+      resolve(null)
+      return
+    }
+    ws.once('open', () => {
+      ws.send(
+        JSON.stringify({
+          id: 1,
+          method: 'initialize',
+          params: { clientInfo: { name: 'nodeterm', version: '1' } }
+        })
+      )
+    })
+    ws.on('message', (raw) => {
+      let message: Record<string, any>
+      try {
+        message = JSON.parse(raw.toString())
+      } catch {
+        return
+      }
+      if (message.id === 1) {
+        if (message.error) return finish(null)
+        ws.send(JSON.stringify({ method: 'initialized' }))
+        ws.send(
+          JSON.stringify({ id: 2, method: 'thread/read', params: { threadId, includeTurns: false } })
+        )
+      } else if (message.id === 2) {
+        const thread = message.result?.thread
+        if (message.error || typeof thread?.id !== 'string' || thread.id !== threadId) {
+          finish(null)
+          return
+        }
+        finish({
+          id: thread.id,
+          name: typeof thread.name === 'string' && thread.name.trim() ? thread.name.trim() : null,
+          path: typeof thread.path === 'string' && path.isAbsolute(thread.path) ? thread.path : null
+        })
+      }
+    })
+    ws.once('error', () => finish(null))
+    ws.once('close', () => finish(null))
+  })
+}
+
+/** Read the logged-in account's email from an app-server socket (`account/read`). Fails to `null`. */
+export function readCodexAccountAt(
+  socketPath: string,
+  timeoutMs = REQUEST_TIMEOUT_MS
+): Promise<{ email: string | null } | null> {
+  return new Promise((resolve) => {
+    let settled = false
+    let ws: WebSocket
+    const finish = (value: { email: string | null } | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try {
+        ws.close()
+      } catch {
+        /* the connection may never have opened */
+      }
+      resolve(value)
+    }
+    const timer = setTimeout(() => finish(null), timeoutMs)
+    timer.unref?.()
+    try {
+      ws = connectCodexAppServer(socketPath)
+    } catch {
+      clearTimeout(timer)
+      resolve(null)
+      return
+    }
+    ws.once('open', () => {
+      ws.send(
+        JSON.stringify({
+          id: 1,
+          method: 'initialize',
+          params: { clientInfo: { name: 'nodeterm', version: '1' } }
+        })
+      )
+    })
+    ws.on('message', (raw) => {
+      let message: Record<string, any>
+      try {
+        message = JSON.parse(raw.toString())
+      } catch {
+        return
+      }
+      if (message.id === 1) {
+        if (message.error) return finish(null)
+        ws.send(JSON.stringify({ method: 'initialized' }))
+        ws.send(JSON.stringify({ id: 2, method: 'account/read', params: {} }))
+      } else if (message.id === 2) {
+        const account = message.result?.account
+        const email =
+          typeof account?.email === 'string' && account.email.trim()
+            ? account.email.trim()
+            : typeof message.result?.email === 'string' && message.result.email.trim()
+              ? message.result.email.trim()
+              : null
+        finish(message.error ? null : { email })
+      }
+    })
+    ws.once('error', () => finish(null))
+    ws.once('close', () => finish(null))
+  })
+}
+
+/** Drop the memoized/coalesced name state — for tests and for a relay/account-set change. */
+export function forgetCodexSessionNames(): void {
+  names.clear()
+  inflight.clear()
+}
+
+/**
  * The READ leg for `TITLE_READ_CAPABLE`. Memoized for `CACHE_MS` and coalesced, because the
  * session-name sweep asks once a minute PER NODE and every ask is a socket connect.
+ *
+ * When the shared app-server reports no name, fall back to the relay's on-disk copy
+ * (`relayedCodexSessionName`) so a conversation forked in the TUI still shows its title.
  */
 export function readCodexSessionName(
   threadId: string,
   socketPath = defaultCodexAppServerSocket()
 ): Promise<string | null> {
-  if (!SAFE_THREAD_ID.test(threadId)) return Promise.resolve(null)
+  if (!isSafeThreadId(threadId)) return Promise.resolve(null)
   const key = `${socketPath}\0${threadId}`
   const cached = names.get(key)
   if (cached && Date.now() - cached.at < CACHE_MS) return Promise.resolve(cached.name)
   const running = inflight.get(key)
   if (running) return running
   const request = readCodexSessionNameAt(socketPath, threadId).then(
-    (name) => {
+    (serverName) => {
+      const name = serverName ?? relayedCodexSessionName(socketPath, threadId)
       names.set(key, { name, at: Date.now() })
       inflight.delete(key)
       return name

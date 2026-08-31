@@ -7,6 +7,7 @@
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+import { parseEndpointEnv } from '../hook-endpoint-parse'
 
 export const PLUGIN_MARKER = '// nodeterm managed plugin — do not edit (reinstalled at app launch)'
 
@@ -52,6 +53,12 @@ export function buildOpencodePlugin(): string {
 import fs from 'node:fs'
 import http from 'node:http'
 
+// The SAME quote-aware parser every TS consumer of the endpoint file uses, embedded verbatim
+// (this plugin runs standalone under Bun/node — it cannot import from the app). Values are
+// posixQuote'd since #351; a quote-blind read would present a token wrapped in literal quotes,
+// which the hook server's constant-time bearer check rejects on every POST.
+const parseEndpointEnv = ${parseEndpointEnv.toString()}
+
 export const NodetermStatus = async () => {
   const nodeId = process.env.NODETERM_NODE_ID
   if (!nodeId) return {}
@@ -60,27 +67,44 @@ export const NodetermStatus = async () => {
       port: process.env.NODETERM_HOOK_PORT,
       sock: process.env.NODETERM_HOOK_SOCK,
       token: process.env.NODETERM_HOOK_TOKEN,
-      version: process.env.NODETERM_HOOK_VERSION
+      version: process.env.NODETERM_HOOK_VERSION,
+      tokenDir: process.env.NODETERM_NODE_TOKEN_DIR
     }
     try {
       const file = process.env.NODETERM_HOOK_ENDPOINT
       if (file) {
-        for (const line of fs.readFileSync(file, 'utf8').split('\\n')) {
-          const m = line.match(/^NODETERM_HOOK_(PORT|SOCK|TOKEN|VERSION)=(.*)$/)
-          if (m) conf[m[1].toLowerCase()] = m[2]
-        }
+        const env = parseEndpointEnv(fs.readFileSync(file, 'utf8'))
+        if ('NODETERM_HOOK_PORT' in env) conf.port = env.NODETERM_HOOK_PORT
+        if ('NODETERM_HOOK_SOCK' in env) conf.sock = env.NODETERM_HOOK_SOCK
+        if ('NODETERM_HOOK_TOKEN' in env) conf.token = env.NODETERM_HOOK_TOKEN
+        if ('NODETERM_HOOK_VERSION' in env) conf.version = env.NODETERM_HOOK_VERSION
+        // The v2 endpoint line: where this instance keeps per-node tokens.
+        if ('NODETERM_NODE_TOKEN_DIR' in env) conf.tokenDir = env.NODETERM_NODE_TOKEN_DIR
       }
     } catch {}
     return conf
   }
+  // The PER-NODE capability, read fresh per POST from <dir>/<nodeId> — a lookup by name, never a
+  // scan, so this session can only ever present its own. Missing (pre-v2 endpoint, a node whose
+  // token was never materialised) is an ordinary state: the header goes out EMPTY and the server
+  // reads that as legacy, exactly like every client that predates this.
+  const nodeToken = (dir) => {
+    try {
+      if (!dir) return ''
+      return fs.readFileSync(dir + '/' + nodeId, 'utf8').split('\\n')[0].trim()
+    } catch {
+      return ''
+    }
+  }
   const post = (event, extra) => {
     try {
-      const { port, sock, token, version } = live()
+      const { port, sock, token, version, tokenDir } = live()
       if (!token || (!sock && !port)) return
       const payload = JSON.stringify({ event, ...extra })
       const headers = {
         'content-type': 'application/x-www-form-urlencoded',
-        'x-nodeterm-hook-token': token
+        'x-nodeterm-hook-token': token,
+        'x-nodeterm-node-token': nodeToken(tokenDir)
       }
       const body =
         'nodeId=' + encodeURIComponent(nodeId) +

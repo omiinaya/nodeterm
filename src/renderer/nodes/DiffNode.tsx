@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { NodeResizer, useReactFlow, type NodeProps } from '@xyflow/react'
+import { useReactFlow, type NodeProps } from '@xyflow/react'
+import { NODE_MIN_SIZES } from '../lib/nodeSizing'
+import { MatchSizeNodeResizer } from '../canvas/MatchSizeNodeResizer'
 import { monaco } from '../editor/monaco-setup'
 import { monacoTheme } from '../lib/appTheme'
 import { useAppTheme } from '../state/useAppTheme'
@@ -9,6 +11,7 @@ import { sshFs } from '../terminal/ssh-fs'
 import { useSession } from '../session/session'
 import type { CanvasNode } from '../state/workspace'
 import { tooLargeSize, formatBytes } from '@shared/fsLimits'
+import { MaximizeButton } from './MaximizeButton'
 
 /**
  * A Monaco diff editor node for a changed file. Staged diff = HEAD vs index;
@@ -135,7 +138,7 @@ export function DiffNode({ id, data, selected }: NodeProps<CanvasNode>) {
       className={`term-node editor-node${selected ? ' selected' : ''}`}
       style={{ borderTopColor: data.color }}
     >
-      <NodeResizer minWidth={420} minHeight={220} isVisible={selected} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.diff.width} minHeight={NODE_MIN_SIZES.diff.height} isVisible={selected} color={data.color} />
 
       <div className="term-node__header">
         <span className="term-node__title-text" title={`${rel} — ${commitOid ? commitOid.slice(0, 7) : staged ? 'staged' : 'working'}`}>
@@ -143,6 +146,7 @@ export function DiffNode({ id, data, selected }: NodeProps<CanvasNode>) {
           <span className="diff-node__tag">{commitOid ? commitOid.slice(0, 7) : staged ? 'staged' : 'changes'}</span>
         </span>
         <span className="term-node__spacer" />
+        <MaximizeButton id={id} maximized={!!data.premaxRect} />
         <button
           className="term-node__close"
           title="Close"

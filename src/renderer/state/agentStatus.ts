@@ -44,12 +44,20 @@ export interface AgentNodeStatus {
    */
   stateAt?: number
   /**
-   * When this node last CHANGED state — the idle clock the hibernation policy reads
-   * (`terminal/hibernation-policy.ts`). Deliberately not `stateAt`: that one is refreshed by
-   * every same-state event (freshness), while "how long has this session been idle" means "how
-   * long since the turn ended". TRANSIENT — never persisted: a relaunch has seen no events yet,
-   * and a stale stamp read as "idle since before the restart" would hibernate a session the
-   * moment the app came back. Absent ⇒ unknown idle ⇒ never a hibernation candidate.
+   * Did the hook POST that set the current `state` carry a per-node token? Mirrors
+   * `MirrorEntry.stateVerified` (core/agent-status-mirror.ts), which is where the messaging gate
+   * actually reads it — this copy exists so the UI can SHOW identity state, not so anything can
+   * gate on it. TRANSIENT, deliberately excluded from the durable whitelist in `save()`: a relaunch
+   * has seen no events, and a restored `true` would assert proof that was never presented this run.
+   */
+  stateVerified?: boolean
+  /**
+   * When this node last CHANGED state (or was explicitly woken) — rendered as the status group's
+   * relative age and also read as the idle clock by `terminal/hibernation-policy.ts`. Deliberately
+   * not `stateAt`: that one is refreshed by every same-state event (freshness), while "how long in
+   * this state" means "how long since the transition". TRANSIENT — never persisted: a relaunch has
+   * seen no events yet, and a stale stamp read as "idle since before the restart" would hibernate a
+   * session the moment the app came back. Absent ⇒ unknown idle ⇒ never a hibernation candidate.
    */
   lastEventAt?: number
   /**
@@ -132,13 +140,16 @@ export interface AgentStatusStore {
   setActive(id: string, active: boolean): void
   /** `newTurn` marks a genuine UserPromptSubmit — the only working that may follow a fresh done.
    *  `pendingId` (deterministic approvals) is retained only while `state === 'blocked'`; any other
-   *  state clears it, so the header's Approve/Deny buttons disappear as soon as the node moves on. */
+   *  state clears it, so the header's Approve/Deny buttons disappear as soon as the node moves on.
+   *  `verified` is the identity evidence for THIS transition (see `stateVerified`); a caller that
+   *  omits it asserts nothing, which is why it is trailing and optional. */
   setState(
     id: string,
     state: AgentState | undefined,
     agentId?: AgentId,
     newTurn?: boolean,
-    pendingId?: string
+    pendingId?: string,
+    verified?: boolean
   ): void
   /** Clear `working` entries whose last event is older than `staleMs` (lost-Stop safety net). */
   sweepStaleWorking(staleMs?: number): void
@@ -309,7 +320,7 @@ export function createAgentStatusSession(
         return s.activeId === id ? { activeId: null } : s
       }),
 
-    setState: (id, state, agentId, newTurn, pendingId) =>
+    setState: (id, state, agentId, newTurn, pendingId, verified) =>
       set((s) => {
         const prev = s.byId[id] ?? EMPTY
         const now = Date.now()
@@ -336,13 +347,22 @@ export function createAgentStatusSession(
         ) {
           // Same-state event: refresh freshness in place — stateAt is never rendered, and a
           // new object here would re-render every node header on each tool event.
-          if (s.byId[id]) s.byId[id].stateAt = now
+          if (s.byId[id]) {
+            s.byId[id].stateAt = now
+            // The evidence rides along, in place and for the same reason: a re-assert of the SAME
+            // state by a legacy POST must not leave an earlier `true` standing, or this copy would
+            // disagree with the mirror the gate actually reads.
+            s.byId[id].stateVerified = verified === true
+          }
           return s
         }
         // The ONE place a state transition is recorded, so it is also the one place the idle
         // clock is stamped (the same-state fast path above deliberately does not touch it —
         // see `lastEventAt`).
         const next = { ...prev, state, stateAt: now, lastEventAt: now }
+        // Written on the same edge the state is — the evidence describes THIS transition, and an
+        // absent argument is not evidence.
+        next.stateVerified = verified === true
         if (agentId !== undefined) next.agentId = agentId
         // Retain the approval ticket only while blocked; any other state clears it (transient).
         next.pendingId = state === 'blocked' ? (pendingId ?? prev.pendingId) : undefined
@@ -403,7 +423,9 @@ export function createAgentStatusSession(
         const byId = { ...s.byId }
         for (const [id, v] of Object.entries(byId)) {
           if (v.state === 'working' && now - (v.stateAt ?? 0) > staleMs) {
-            byId[id] = { ...v, state: undefined, stateAt: now }
+            // This is a real transition to Unknown, even though it did not arrive through a hook.
+            // Stamp both clocks so the sidebar age and Eco idle clock begin at the transition.
+            byId[id] = { ...v, state: undefined, stateAt: now, lastEventAt: now }
             changed = true
           }
         }
@@ -486,14 +508,15 @@ export function createAgentStatusSession(
       set((s) => {
         const prev = s.byId[id]
         if (!prev) return s
-        // Cross-surface ACK: opening a session marks its finishes read EVERYWHERE — the notch
+        // Cross-surface ACK: opening a session marks its finish read EVERYWHERE — the notch
         // capsule's green blob, the paired phone's lingering DONE Live Activity, and its Inbox
-        // Finished card (all via the core mirror's `ackDone`).
+        // Finished card (all via the core mirror's `ackDone`). This is READ state only: the live
+        // workflow state remains `done` until a genuine new turn begins.
         //
         // Deliberately gated on NOTHING but the external flag:
         //  - not on the unread flag, because a session you were LOOKING at when it finished never
-        //    got marked unread (the `watching` gate in Canvas), so opening it would be the only
-        //    read signal there ever is — and it was being dropped;
+        //    got marked unread (the `watching` gate in Canvas), so opening it is the only local
+        //    read signal there will ever be;
         //  - not on the node's current state, because a node whose PREVIOUS turn finished while a
         //    new one is already running left the phone showing a Finished card for a result the
         //    user had open on screen.

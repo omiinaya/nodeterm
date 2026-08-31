@@ -14,15 +14,42 @@ import type { ServerConfig } from './config'
 import { initPlatform } from '../core/platform'
 import { SettingsStore } from '../core/settings-store'
 import { WorkspaceStore } from '../core/workspace-store'
+import { registerAgentEnvIpc } from '../core/agent-env-ipc'
 import { PtyManager } from '../core/pty-manager'
 import { registerCoreHandlers } from './handlers'
 import { registerGitHubIntegration } from '../core/github/integration'
 import { runGitHubCliCommand } from '../core/github/credentials'
-import { registerServerGitHubControl, ServerGitHubSecretStore } from './github-control'
+import {
+  registerServerGitHubControl,
+  ServerGitHubSecretStore,
+  ServerSecretStore
+} from './github-control'
+import {
+  migrateLegacyModelGatewayKey,
+  MODEL_GATEWAY_SECRET_FILE,
+  ModelGatewayCredentialService
+} from '../core/model-gateway-credentials'
 import { DownloadTickets } from '../core/download-tickets'
 import { registerBoardLogHandlers, type BoardLogRoute } from '../core/board-log-handlers'
+import { ProjectTrustStore } from '../core/project-trust-store'
+import { ProjectSetupService } from '../core/project-setup-service'
+import {
+  makeProjectTrustRequester,
+  registerProjectSetupHandlers,
+  type ProjectSetupHandlerDeps
+} from '../core/project-setup-handlers'
+import { registerProjectLaunchInfoHandlers } from '../core/project-launch-info-handlers'
+import { registerWorktreeSharedPathsHandlers } from '../core/worktree-shared-paths-handlers'
+import { makeProjectSpawnOverrides } from '../core/project-spawn-overrides'
+import { makeLocalSetupRunner } from '../core/project-setup-runner-local'
+import { LogBuffer } from '../core/log-buffer'
+import { installLogSink } from '../core/log-sink'
+import { registerLogHandlers } from '../core/log-handlers'
 import os from 'os'
 import { hookServer } from '../core/agents/hook-server'
+import { serverEditionControlHandler } from './control-unsupported'
+import { refreshNodeTokens } from '../core/agents/node-token-service'
+import { armServerNodeIdentity } from './node-identity-arm'
 import {
   writePendingAnswerLocal,
   startPendingSweep,
@@ -30,6 +57,7 @@ import {
   syntheticAnsweredEvent
 } from '../core/agents/pending-approvals'
 import { installManagedAgentHooks } from '../core/agents/hooks'
+import { installHooksIntoLocalAccounts } from '../core/claude-accounts-service'
 import {
   initAgentStatusMirror,
   flush as flushAgentStatusMirror,
@@ -156,8 +184,32 @@ export async function startServer(
   const workspaceStore = new WorkspaceStore()
 
   settingsStore.init()
+  const gatewayCredentials = new ModelGatewayCredentialService(
+    new ServerSecretStore(config.dataDir, MODEL_GATEWAY_SECRET_FILE)
+  )
+  await gatewayCredentials.init()
+  try {
+    const migratedGateway = await migrateLegacyModelGatewayKey(
+      settingsStore.get().modelGateway,
+      gatewayCredentials
+    )
+    if (migratedGateway) {
+      await settingsStore.save({ ...settingsStore.get(), modelGateway: migratedGateway })
+    }
+  } catch (error) {
+    console.warn('[model-gateway] could not migrate the legacy API key to secret storage', error)
+  }
   settingsStore.registerIpc()
-  ptyManager.init(() => settingsStore.get())
+  // Gateway discovery/credential IPC. NO env snapshot on the server: every registered handler
+  // here is dispatchable by any authenticated WS client, and the server process environment is
+  // exactly the secret store that must never cross that boundary. Browser clients hardcode an
+  // empty snapshot and `${env:VAR}` expansion degrades to the missing-env refusal; discovery
+  // resolves key REFERENCES only for the saved gateway URL (the exfil-oracle gate in core).
+  registerAgentEnvIpc(() => settingsStore.get().modelGateway, gatewayCredentials)
+  ptyManager.init(
+    () => settingsStore.get(),
+    () => gatewayCredentials.readForHost()
+  )
   ptyManager.registerIpc()
   workspaceStore.registerIpc()
   // Dictation: same construction as src/main/index.ts, with the server's data dir. onProgress
@@ -226,6 +278,51 @@ export async function startServer(
     downloadTickets,
     localProjectCwd: (projectId: string) => workspaceStore.localCwdForProject(projectId)
   })
+  // Project setup/archive runner — same construction as src/main/index.ts, and the SAME
+  // `registerProjectSetupHandlers` trust boundary (project-setup-handlers.ts): it derives rootPath/
+  // ssh/projectName from THIS process's own workspace index by projectId, never the renderer, and
+  // re-validates `worktreePath` against the project's actual git worktrees. No ssh leg here at all
+  // (the Server Edition has no SSH projects, same reason board-log's router below never resolves
+  // one) — `projectTargetInfo` never populates `ssh` on this shell, so an ssh-shaped target simply
+  // never arises.
+  const projectTrustStore = new ProjectTrustStore()
+  const projectSetupService = new ProjectSetupService({
+    trust: projectTrustStore,
+    readSettings: (projectId) => workspaceStore.readProjectSettings(projectId),
+    runLocal: makeLocalSetupRunner()
+  })
+  const projectSetupDeps: ProjectSetupHandlerDeps = {
+    projectTargetInfo: (projectId) => workspaceStore.projectTargetInfo(projectId),
+    worktreeList: (repoPath) => gitService.worktreeList(repoPath)
+  }
+  registerProjectSetupHandlers(platform, projectSetupService, projectSetupDeps)
+  // `worktree:materialize-shared` — same sibling registrar and trust boundary as main/index.ts,
+  // over this process's own stores. The Server Edition has no SSH projects, so an ssh-shaped target
+  // never arises; the path validation and by-projectId list read are identical.
+  registerWorktreeSharedPathsHandlers(platform, {
+    readSettings: (projectId) => workspaceStore.readProjectSettings(projectId),
+    targetInfo: projectSetupDeps.projectTargetInfo,
+    worktreeList: projectSetupDeps.worktreeList
+  })
+  // `project-settings:launch-info` — same sibling registrar as main/index.ts, sharing this
+  // process's own trust store.
+  registerProjectLaunchInfoHandlers(platform, workspaceStore, projectTrustStore)
+  // Project env + shell at the spawn — the same core factory main/index.ts wires, over this
+  // shell's own stores. `requestTrust` is wired here too, and deliberately so: the Server Edition's
+  // consent prompt goes to `platform.broadcast` (the service's default `sendConsent`), which is the
+  // right delivery HERE — every attached client is an authenticated operator of this host — where
+  // on the desktop it would also reach relay peers. A headless server with nobody attached simply
+  // gets no answer, the prompt expires, and the shared value stays unused: fail closed on the
+  // grant, fail open on the spawn.
+  ptyManager.setProjectSpawnOverrides(
+    makeProjectSpawnOverrides({
+      readSettings: (projectId) => workspaceStore.readProjectSettings(projectId),
+      targetInfo: (projectId) => workspaceStore.projectTargetInfo(projectId),
+      trust: projectTrustStore,
+      requestTrust: makeProjectTrustRequester(projectSetupService, projectSetupDeps)
+    })
+  )
+
   const github = registerGitHubIntegration({
     platform,
     userDataDir: config.dataDir,
@@ -245,6 +342,12 @@ export async function startServer(
       return cwd ? { kind: 'local', cwd } : { kind: 'unsupported' }
     }
   })
+
+  // Debug log ring (issue #78) — same core registrar as desktop. Headless is where a swallowed
+  // console hurts most; the browser-side panel reads this process's ring over the bridge.
+  const logBuffer = new LogBuffer()
+  installLogSink(logBuffer)
+  registerLogHandlers(platform, logBuffer, () => settingsStore.get().debugLogPanel)
 
   // Agent status pipeline — mirrors the desktop boot order in src/main/index.ts:
   // mirror-init → wire the hook-server listeners onto the platform → install the managed hook
@@ -414,8 +517,36 @@ export async function startServer(
     } catch (e) {
       console.warn('[nodeterm-server] managed hook install failed', e)
     }
+    // Managed Claude accounts each carry their OWN settings.json (Claude Code resolves it relative
+    // to CLAUDE_CONFIG_DIR), so the hook has to be re-installed there as well or a managed account
+    // reports no agent status at all. Same loop the desktop runs, minus the canvas skill: canvas
+    // control is not wired on this edition. Per-account fail-open lives inside the helper.
+    installHooksIntoLocalAccounts(settingsStore.get().claudeAccounts ?? [])
   }
   await hookServer.start()
+  // Canvas control does not exist on this edition, and saying so BY NAME is the whole point: the
+  // null handler answered `control unavailable`, which reads to an agent like a transient outage,
+  // and an agent retries an outage. See `control-unsupported.ts`.
+  hookServer.setControlHandler(serverEditionControlHandler)
+
+  // ---- Node identity (src/core/agents/node-auth-secret.ts) ------------------------------------
+  // First time the Server Edition arms node identity. Headless Linux has no OS keychain, so the
+  // secret is stored as raw 0600 bytes (node-auth-key.bin); the loader handles the at-rest format.
+  // FAIL OPEN and LOUD: if the secret can't be created/read, identity stays unavailable (legacy
+  // mode) and the hook server keeps serving — a throw here must never block boot or the hooks.
+  // Same escape hatch as the desktop, wired OUTSIDE the try for the same reason: it is not part of
+  // arming the secret, and a headless host in legacy mode is where it is most likely to be needed.
+  hookServer.setIdentityStrictOverride(() => settingsStore.get().hookIdentityStrict)
+  try {
+    // The whole node-identity arming (node secret + the S6 Codex record secret + node tokens) lives
+    // in one REAL production function so the boot test can drive the shipped path rather than a
+    // re-implementation of it (constraint 8). It arms `setCodexThreadIdentityAuthSecret` with the
+    // same secret so a MANAGED Codex account on a headless host signs/verifies its ownership records
+    // instead of throwing "identity authentication is unavailable" (Decision 1, both-shells).
+    await armServerNodeIdentity(hookServer, () => workspaceStore.persistedCanvases())
+  } catch (error) {
+    console.warn('[node-identity] no secret — hook identity unavailable, running legacy', error)
+  }
 
   // Context Link: core owns the whole feature (read handler, shim, skill, instruction blocks) and
   // writes everything under `dataDir`; what it needs from a shell is the link map. The desktop's
@@ -429,7 +560,10 @@ export async function startServer(
   })
   // Every load()/save() is a canvas change as far as links are concerned: a browser drawing a
   // bridge edge reaches us as the workspace save it triggers.
-  workspaceStore.onPersist = () => void contextLink.refresh()
+  workspaceStore.onPersist = () => {
+    contextLink.refresh()
+    refreshNodeTokens()
+  }
   // Nothing has read the workspace index yet — the desktop gets its first load from the renderer,
   // and this shell may never have one. Read it once so links are live before any browser connects.
   // Read-only: boot must not sideline a conflict-marked project.json (that stays a renderer/probe
@@ -533,6 +667,9 @@ export async function startServer(
     return {
       port: 0, // nothing bound
       async close() {
+        // Kill any in-flight setup/archive run: it is a detached process group, so nothing else in
+        // this teardown reaches it. Same call, same reason, in the serving branch's close() below.
+        projectSetupService.disposeAll()
         // Detach PTY clients — tmux sessions keep running (Phase 1 contract).
         sessionReaper.stop()
         pressure.stop()
@@ -585,6 +722,9 @@ export async function startServer(
   return {
     port,
     async close() {
+      // Kill any in-flight setup/archive run first: it is a detached process group (setsid), so
+      // neither the WS teardown nor ptyManager.killAll() below would ever reach it.
+      projectSetupService.disposeAll()
       // Detach PTY clients — tmux sessions keep running (Phase 1 contract; never kill the server).
       sessionReaper.stop()
       pressure.stop()

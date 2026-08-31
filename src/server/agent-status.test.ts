@@ -13,7 +13,14 @@ import { decodePtyData } from '../shared/rpc'
 // fire raw + normalized events without binding a real port.
 function fakeHooks() {
   let listener: ((e: unknown) => void) | undefined
-  let raw: ((agentId: string, nodeId: string, payload: Record<string, unknown>) => void) | undefined
+  let raw:
+    | ((
+        agentId: string,
+        nodeId: string,
+        payload: Record<string, unknown>,
+        meta: { verified: boolean }
+      ) => void)
+    | undefined
   return {
     hooks: {
       setListener: (cb: (e: unknown) => void) => {
@@ -24,8 +31,14 @@ function fakeHooks() {
       }
     },
     fireNormalized: (e: unknown) => listener?.(e),
-    fireRaw: (agentId: string, nodeId: string, payload: Record<string, unknown>) =>
-      raw?.(agentId, nodeId, payload)
+    // `verified` defaults to false — the unlabelled/legacy POST, which is the ordinary case and the
+    // one every existing expectation in this file was written against.
+    fireRaw: (
+      agentId: string,
+      nodeId: string,
+      payload: Record<string, unknown>,
+      verified = false
+    ) => raw?.(agentId, nodeId, payload, { verified })
   }
 }
 
@@ -35,6 +48,7 @@ function recTail() {
   return {
     tail: {
       track: (...args: unknown[]) => calls.push({ m: 'track', args }),
+      trackFile: (...args: unknown[]) => calls.push({ m: 'trackFile', args }),
       finish: (...args: unknown[]) => calls.push({ m: 'finish', args }),
       untrack: (...args: unknown[]) => calls.push({ m: 'untrack', args })
     },
@@ -138,6 +152,78 @@ describe('wireAgentStatus', () => {
     wireAgentStatus(platform, { hooks: fh.hooks as never, subagentTail: sub.tail as never })
     fh.fireRaw('codex', 'n1', { hook_event_name: 'PreToolUse', tool_name: 'Task', tool_use_id: 'x' })
     expect(sub.calls).toEqual([])
+  })
+
+  // Codex subagents (spawn_agent): payload shapes from the live codex-cli 0.146.0 capture —
+  // SubagentStart's transcript_path is the CHILD's rollout, keyed by agent_id.
+  it('codex SubagentStart tails the child rollout via trackFile, SubagentStop finishes it', () => {
+    const fh = fakeHooks()
+    const sub = recTail()
+    wireAgentStatus(platform, { hooks: fh.hooks as never, subagentTail: sub.tail as never })
+    const childPath = path.join(os.homedir(), '.codex', 'sessions', '2026', '08', '24', 'rollout-child.jsonl')
+    fh.fireRaw('codex', 'n1', {
+      hook_event_name: 'SubagentStart',
+      session_id: 'parent-s',
+      transcript_path: childPath,
+      agent_id: 'agent-1',
+      agent_type: 'default'
+    })
+    const tf = sub.calls.find((c) => c.m === 'trackFile')
+    expect(tf?.args[0]).toBe('agent-1')
+    expect(tf?.args[1]).toBe(path.resolve(childPath))
+    fh.fireRaw('codex', 'n1', {
+      hook_event_name: 'SubagentStop',
+      session_id: 'parent-s',
+      agent_id: 'agent-1',
+      agent_type: 'default',
+      last_assistant_message: 'done'
+    })
+    expect(sub.calls.some((c) => c.m === 'finish' && c.args[0] === 'agent-1')).toBe(true)
+  })
+
+  it('a codex SubagentStart outside the transcript jail does not tail anything', () => {
+    const fh = fakeHooks()
+    const sub = recTail()
+    wireAgentStatus(platform, { hooks: fh.hooks as never, subagentTail: sub.tail as never })
+    fh.fireRaw('codex', 'n1', {
+      hook_event_name: 'SubagentStart',
+      session_id: 'parent-s',
+      transcript_path: path.join(os.homedir(), '.ssh', 'id_rsa'),
+      agent_id: 'agent-evil'
+    })
+    const tf = sub.calls.find((c) => c.m === 'trackFile')
+    expect(tf?.args[1]).toBeUndefined() // jailed → tail ignores it
+  })
+
+  it("a codex child's agent_id-tagged tool event neither tracks a subagent nor throws", () => {
+    const fh = fakeHooks()
+    const sub = recTail()
+    wireAgentStatus(platform, { hooks: fh.hooks as never, subagentTail: sub.tail as never })
+    fh.fireRaw('codex', 'n1', {
+      hook_event_name: 'PreToolUse',
+      session_id: 'parent-s',
+      agent_id: 'agent-1',
+      agent_type: 'default',
+      tool_name: 'Bash',
+      tool_input: { command: 'echo hi' },
+      transcript_path: path.join(os.homedir(), '.codex', 'sessions', 'child.jsonl')
+    })
+    expect(sub.calls).toEqual([])
+  })
+
+  it('codex SubagentStop finish is covered by ptyDestroy cleanup too', () => {
+    const fh = fakeHooks()
+    const sub = recTail()
+    wireAgentStatus(platform, { hooks: fh.hooks as never, subagentTail: sub.tail as never })
+    const childPath = path.join(os.homedir(), '.codex', 'sessions', 'rollout-child.jsonl')
+    fh.fireRaw('codex', 'n1', {
+      hook_event_name: 'SubagentStart',
+      session_id: 'parent-s',
+      transcript_path: childPath,
+      agent_id: 'agent-1'
+    })
+    platform.cast(platform.attach({ sendText: () => {}, sendBinary: () => {} }), IPC.ptyDestroy, ['n1'])
+    expect(sub.calls.some((c) => c.m === 'finish' && c.args[0] === 'agent-1')).toBe(true)
   })
 
   it('ptyDestroy untracks the node context tail and finishes its subagents, clearing the maps', () => {

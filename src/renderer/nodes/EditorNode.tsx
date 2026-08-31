@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { Handle, NodeResizer, Position, useReactFlow, type NodeProps } from '@xyflow/react'
+import { Handle, Position, useReactFlow, type NodeProps } from '@xyflow/react'
+import { NODE_MIN_SIZES } from '../lib/nodeSizing'
+import { MatchSizeNodeResizer } from '../canvas/MatchSizeNodeResizer'
 import { monaco } from '../editor/monaco-setup'
 import { monacoTheme } from '../lib/appTheme'
 import { useAppTheme } from '../state/useAppTheme'
 import { renderMarkdown } from '../lib/markdown'
+import { opensInPreview } from '../lib/markdownPreview'
 import { useSettings } from '../state/settings'
 import { sshFs } from '../terminal/ssh-fs'
 import { useProjects } from '../state/projects'
@@ -11,7 +14,9 @@ import { useSession } from '../session/session'
 import type { CanvasNode } from '../state/workspace'
 import { tooLargeSize, formatBytes } from '@shared/fsLimits'
 import { hintLabel } from '@shared/platform-utils'
+import { chipFor, commandTooltip } from '../lib/keybindingOverrides'
 import { pdfBlobUrl } from '../lib/pdfBlob'
+import { MaximizeButton } from './MaximizeButton'
 
 // Image extensions get a visual preview instead of the Monaco text editor.
 const IMAGE_MIME: Record<string, string> = {
@@ -221,6 +226,14 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
       savedRef.current = content
       editor.onDidChangeModelContent(() => setDirty(editor!.getValue() !== savedRef.current))
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current())
+      // Markdown files can open straight into the rendered preview (settings.openMarkdownPreview).
+      // Decided here rather than at useState-init because the preview needs the file content —
+      // this is exactly the state a Preview click right after load would produce, so Edit/⌘M
+      // toggle back as usual.
+      if (opensInPreview(ext, s.openMarkdownPreview)) {
+        setPreviewHtml(renderMarkdown(content))
+        setPreview(true)
+      }
     })
 
     return () => {
@@ -238,6 +251,10 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
     if (hoveredRef.current) toggleRef.current()
   }), [])
 
+  // Whatever the markdown toggle is bound to; '' when the user unbound it, in which case the
+  // preview's hint names the action instead of promising a chord that never fires.
+  const mdChip = chipFor('node.toggleMarkdown')
+
   return (
     <div
       className={`term-node editor-node${selected ? ' selected' : ''}`}
@@ -245,7 +262,7 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
       onMouseEnter={() => (hoveredRef.current = true)}
       onMouseLeave={() => (hoveredRef.current = false)}
     >
-      <NodeResizer minWidth={320} minHeight={200} isVisible={selected} color={data.color} />
+      <MatchSizeNodeResizer nodeId={id} minWidth={NODE_MIN_SIZES.editor.width} minHeight={NODE_MIN_SIZES.editor.height} isVisible={selected} color={data.color} />
       {/* Invisible target handle so a rope from an agent node that opened this can attach. */}
       <Handle
         id="flow-in"
@@ -267,7 +284,7 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
           <>
             <button
               className="editor-node__toggle"
-              title={hintLabel('Toggle markdown preview (⌘M)')}
+              title={commandTooltip('Toggle markdown preview', 'node.toggleMarkdown')}
               onClick={togglePreview}
             >
               {preview ? 'Edit' : 'Preview'}
@@ -282,6 +299,7 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
             </button>
           </>
         )}
+        <MaximizeButton id={id} maximized={!!data.premaxRect} />
         <button
           className="term-node__close"
           title="Close"
@@ -335,7 +353,7 @@ export function EditorNode({ id, data, selected }: NodeProps<CanvasNode>) {
               <div className="term-md nodrag nowheel">
                 <div className="term-md__bar">
                   <span>Preview</span>
-                  <span className="term-md__hint">{hintLabel('⌘M to edit')}</span>
+                  <span className="term-md__hint">{mdChip ? `${mdChip} to edit` : 'Edit'}</span>
                 </div>
                 <div
                   className="term-md__content"

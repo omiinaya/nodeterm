@@ -1,4 +1,6 @@
 import { useEffect } from 'react'
+import type { ProjectIcon } from '@shared/project-icon'
+import { ProjectGlyph } from './ProjectGlyph'
 
 interface WelcomeScreenProps {
   onNewProject: () => void
@@ -6,8 +8,14 @@ interface WelcomeScreenProps {
   onCloneRepo: () => void
   /** Open the "Connect over SSH…" flow to create a project hosted on a remote server. */
   onConnectSsh: () => void
-  /** Closed projects that can be reopened (id + display name + folder). */
-  closedProjects?: { id: string; name: string; cwd?: string }[]
+  /** Closed projects that can be reopened (id + display name + folder + icon/color). */
+  closedProjects?: { id: string; name: string; cwd?: string; color?: string; icon?: ProjectIcon }[]
+  /**
+   * LIVE local `nt-*` session count per closed project id (one on-demand sweep — see Canvas).
+   * A closed project parks its sessions invisibly (issue #442); this badge is what says they
+   * exist. Absent map or missing id = NOT MEASURED, so no badge — never a claimed "0".
+   */
+  sessionCounts?: Record<string, number>
   /** Reopen a closed project (restores its nodes + sessions). */
   onReopen?: (id: string) => void
   /** Permanently delete a closed project (ends its tmux sessions). */
@@ -32,6 +40,7 @@ export function WelcomeScreen({
   onCloneRepo,
   onConnectSsh,
   closedProjects = [],
+  sessionCounts,
   onReopen,
   onDeleteClosed,
   onClose,
@@ -145,11 +154,26 @@ export function WelcomeScreen({
                   if (e.key === 'Enter' || e.key === ' ') onReopen?.(p.id)
                 }}
               >
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-                </svg>
+                <ProjectGlyph
+                  icon={p.icon}
+                  color={p.color}
+                  name={p.name}
+                  variant="monogram"
+                  size={15}
+                  className="welcome__recent-mark"
+                />
                 <span className="welcome__recent-name">{p.name}</span>
                 {p.cwd && <span className="welcome__recent-path">{p.cwd}</span>}
+                {(sessionCounts?.[p.id] ?? 0) > 0 && (
+                  <span
+                    className="welcome__recent-sessions"
+                    title={`${sessionCounts![p.id]} tmux session${
+                      sessionCounts![p.id] === 1 ? ' from this project is' : 's from this project are'
+                    } still running on this machine. Reopen the project to pick them up, or × to delete it and end them.`}
+                  >
+                    {sessionCounts![p.id]} running
+                  </span>
+                )}
                 {onDeleteClosed && (
                   <button
                     className="welcome__recent-del"

@@ -1,0 +1,462 @@
+/* ============================================================
+   cli-mono — design tokens
+   Extracted from the oem/log design system (log.oem.ngo).
+   Pure black/grey/white, monospace, terminal identity.
+   DARK IS THE DEFAULT. Light is an explicit opt-in via
+   [data-theme='light'] (or :root[data-theme='light']).
+
+   Zero dependencies. No build step. Drop this file in first,
+   then base.css, then components.css.
+   ============================================================ */
+
+:root {
+	/* ---- layout ------------------------------------------------
+	   ONE content width for every page. Page-specific widths were
+	   the cause of layout shifting on every navigation. --gutter is the
+	   single source of side padding for main/header/footer, and
+	   --head-top / --head-h1 are the single source for the top-of-page
+	   head block so every route starts its content at the same y. */
+	--maxw: 860px;
+	/* Desktop nav rail. A reference doc with 20 destinations cannot live in
+	   a horizontal bar: measured, 7 links wrapped across 7 rows and pushed
+	   the content 256px down. The rail is 232px, wide enough for the longest
+	   label at --min-font, and it only exists above --bp-rail. */
+	--rail-w: 232px;
+	--gutter: 1.25rem;
+	--head-top: 3rem;
+	--head-h1: 2rem;
+	/* The SECOND step of the heading scale, and the one an application
+	   page uses most. It was a raw 1.15rem inside `.cm-section__title`,
+	   so the step between a panel heading and a page title could not be
+	   retuned without editing a rule rather than a scale. The gap is what
+	   matters: MEASURED on rpm's Dashboard, the page title and a panel
+	   heading both computed 32px / w700, which is why the scale looked
+	   like it had only one step. */
+	/* ONE source for the section-heading step. It used to declare its
+	   own 1.15rem here AND live on the text scale as --text-md, so
+	   a retune of one silently left the other behind - which is how
+	   the heading and the data under it ended up identical. The
+	   heading scale is the text scale's top end, not a parallel
+	   set of numbers. */
+	--head-h2: var(--text-md);
+
+	/* ---- the TEXT scale ----------------------------------------
+	   The heading scale above has three steps, which is all a page
+	   needs. BODY text was never given a scale at all: rules reached
+	   for raw rem literals - 0.7, 0.72, 0.8, 0.84, 1.05 - and MEASURED
+	   on rpm's Dashboard that produced TWELVE distinct rendered sizes
+	   (32, 21.6, 18.4, 16.8, 16, 13.6, 13.44, 13.12, 12.8, 12, 11.52,
+	   11.2) for what should be five jobs. A page with no type scale
+	   reads as flat no matter how good the spacing is: every size
+	   differs from its neighbour by a couple of pixels, so nothing
+	   groups and the eye has to work out what belongs to what.
+
+	   Five steps, and every body-size rule resolves one of them:
+	     --text-lg    a value that is the POINT of its panel (a count)
+	     --text       the default reading size
+	     --text-sm    secondary text: meta, help, a row's description
+	     --text-xs    a label, a tag, a chip
+	     --text-micro the uppercase tracked label, and the floor
+	   --min-font below is the hard WCAG/iOS floor and is deliberately
+	   the same number as --text-xs, so a rule that reaches for either
+	   lands on the same rendered size. */
+	--text-lg: 1.35rem;
+	/* The one step between a section heading (--head-h2, 18.4px) and body
+	   text. A metric VALUE belongs here and not at --text-lg: a tile whose
+	   number is louder than the heading that introduces it inverts the
+	   reading order, and MEASURED on rpm that was exactly what the
+	   Dashboard did - 21.6px figures against 18.4px headings, so the
+	   data outweighed the structure meant to organise it. */
+	/* --text-md is the SECTION HEADING step, and --text is the data step
+	   under it. They sat at the same value for a while, which MEASURED
+	   as a hero numeral and its own panel title both rendering 18.4px
+	   at w700 in the same white: the data and the thing meant to
+	   organise it were indistinguishable by size, and enclosure was
+	   the only thing telling them apart. The scale needs a real step
+	   between them, so the heading owns --text-md and the value one
+	   step below. */
+	--text-md: 1.25rem;
+	--text: 1rem;
+	--text-sm: 0.875rem;
+	--text-xs: 0.8125rem;
+	/* NOT 0.7rem. The smallest step is the uppercase tracked label, it
+	   is a real label and not decoration, and 0.7rem computed to
+	   11.2px - under the 12px floor. A scale step that sits below the
+	   accessibility floor is a step the system should not have, so the
+	   floor wins: 0.75rem lands on 12px exactly and the scale still
+	   steps down from --text-xs. */
+	--text-micro: 0.75rem;
+	/* The house shape is SHARP. These stay as tokens (consumers reference
+	   them) but are zero: one place to change, and nothing rounds by accident. */
+	--radius: 0;
+	--radius-sm: 0;
+
+	/* ---- measure (line length) ----------------------------------
+	   A width in `ch` against the monospace font, so a line's character
+	   count is the thing being decided rather than an accident of the
+	   container. Three widths are genuinely different jobs, and every
+	   one of them existed as a raw number somewhere:
+	     --measure        a reading column, the one prose sits in
+	     --measure-narrow  a single compact block (a status line, a
+	                       definition body) that must not be re-wrapped,
+	                       and the excerpt column of a list row
+	     --measure-title  the title column of a list row, so the
+	                       excerpts line up instead of every row
+	                       starting its text at a different offset
+	   Declared here rather than per component because a measure is a
+	   property of TYPE, not of a component: a consumer that invents its
+	   own is how oem-portfolio ended up with 34ch, 58ch and 68ch
+	   literals in one file, none of them named. A `ch` literal
+	   anywhere but this file is a rebrand bug, and a test enforces it. */
+	--measure: 68ch;
+	--measure-narrow: 34ch;
+	--measure-title: 42ch;
+
+	/* Widest colour swatch: the chip (1.4em) + its gap + the longest token
+	   name in the system at --min-font. Sized once, from the tokens. */
+	--swatch-col: calc(1.4em + var(--space-2) + 15ch);
+
+	/* ---- spacing scale -----------------------------------------
+	   The ONLY legal vertical and inline rhythm. Before this existed the
+	   two layers carried 69 distinct spacing values (0.15rem .. 6rem),
+	   so two heroes built a week apart could not share a rhythm and a
+	   tightened gap was indistinguishable from a bug. Every spacing
+	   value below is one of these steps.
+	   0.125  2px   hairline nudges, icon-to-label
+	   0.25   4px   tight stacks, inside a control
+	   0.5    8px   the default gap between related items
+	   0.75  12px   label to its value
+	   1     16px   between blocks; the workhorse
+	   1.25  20px   group separation
+	   1.5   24px   between sections
+	   2     32px   between major blocks
+	   3     48px   between page sections
+	   4     64px   above a top-of-page head
+	   6     96px   page-level breathing room  */
+	--space-0: 0.125rem;
+	--space-1: 0.25rem;
+	--space-2: 0.5rem;
+	--space-3: 0.75rem;
+	--space-4: 1rem;
+	--space-5: 1.25rem;
+	--space-6: 1.5rem;
+	--space-7: 2rem;
+	--space-8: 3rem;
+	--space-9: 4rem;
+	--space-10: 6rem;
+
+	/* ---- rhythm ------------------------------------------------
+	   THE spacing contract for stacked blocks. The --space-N scale says
+	   WHICH sizes exist; these say WHICH ONE GOES WHERE, which is the
+	   thing that was missing and the reason five projects each invented
+	   their own gap between sections.
+
+	   Before this, `.cm-head` had margin-bottom: 0 and no component
+	   owned section-to-section space at all. Measured across oem-ui,
+	   oem-portfolio, dev-blog, links and log: EVERY one of them put
+	   content flush against the head block at exactly 0px, and oem-ui
+	   had 15 such joins internally. A scale without a rhythm is a
+	   palette, not a system.
+
+	   --stack-gap        : the default between siblings in a .cm-stack
+	   --stack-section    : between top-level page sections
+	   --stack-head       : below a page/section head block
+	   --stack-tight      : for a dense list of small peers (spec rows)
+
+	   Override --stack-section ONCE per project to retune the whole
+	   vertical rhythm; every consumer inherits it without touching a
+	   component rule. */
+	--stack-gap: var(--space-5);
+	--stack-section: var(--space-6);
+	--stack-head: var(--space-5);
+	--stack-tight: var(--space-3);
+
+	/* ---- type --------------------------------------------------
+	   everything is mono: that IS the identity */
+	--font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, 'SF Mono',
+		Menlo, Consolas, monospace;
+	--font-body: var(--font-mono);
+
+	/* ---- motion ------------------------------------------------
+	   every interactive transition in the system is one of these.
+	   0.12s is the house value: present, not sluggish. */
+	--cm-t-fast: 0.1s;
+	--cm-t: 0.12s;
+	--cm-t-slow: 0.2s;
+	--cm-ease: ease;
+
+	/* ---- mobile -----------------------------------------------
+	   Touch ergonomics live in tokens, not in scattered media queries,
+	   so every component inherits them. The 44px minimum is the
+	   WCAG 2.5.5 / iOS guideline for a tap target; --min-font is the
+	   smallest text we will ever render, because a 10px monospace
+	   label is unreadable on a phone at arm's length. */
+	--tap: 44px;
+	/* The chrome size of an inline clear button - the X inside a search
+	   field, a tag's remove, an uploaded file's dismiss. It is NOT a tap
+	   target, which is why it is not --tap: on a fine pointer a mouse
+	   aims at a 32px box comfortably, and a 44px X inside a 32px-tall row
+	   is a control bigger than the thing it clears. On a coarse pointer
+	   it takes the floor instead (see the @media (pointer: coarse) block
+	   in components.css), so the two numbers are never confused.
+
+	   The token exists because the input's padding-right has to CLEAR this
+	   box: a typed value running under the X is the bug that made a
+	   search field unusable. Deriving both from one number means they
+	   cannot drift apart. */
+	--search-clear: 32px;
+	/* The focus ring colour, declared as an ALIAS of --accent-dim rather
+	   than a second literal.
+
+	   This token was USED and never DECLARED. `.cm-search__input:focus-visible`
+	   shipped `outline: 2px solid var(--focus)` and `--focus` existed in
+	   no layer, so the declaration was invalid at computed-value time and
+	   the whole `outline` shorthand collapsed: MEASURED in WebKit at 390,
+	   375 and 1440, `outline-style` computed to `none`. The search field
+	   had no focus ring at all, on every page, in every theme - and a CSS
+	   text scan reads that line as perfectly well-formed.
+
+	   It is an alias, not a copy, on purpose: `var()` is substituted at
+	   computed-value time, so each theme's own --accent-dim is what a
+	   ring actually paints with. Duplicating the hex here would be a
+	   second value to keep in step with the first. */
+	--focus: var(--accent-dim);
+	/* There is deliberately no `--tap-sm`.
+
+	   One was added here -- `--tap-sm: 44px` -- to say "a small label may
+	   shrink a control's chrome, never its hit area". The principle is
+	   right and the token made it a no-op: with `--tap` also 44px, every
+	   `.cm-btn--sm` computed EXACTLY `.cm-btn`'s height, MEASURED in WebKit
+	   at 402, at 375 and at desktop 1280. The dense-row decision the
+	   variant exists for was gone, and the variant was a second name for
+	   the base button.
+
+	   A token whose only legal value equals another token's is a knob that
+	   cannot be turned. Whether a control takes the floor is a question
+	   about the POINTER and the control's ROLE, so it is answered in
+	   components.css - `.cm-btn--sm` steps below the floor on a fine
+	   pointer and takes `var(--tap)` under `@media (pointer: coarse)`.
+	   Both halves are measured; neither is a default. */
+	--min-font: 12px;
+
+	/* ---- switch geometry ----
+	   A 2:1 track, and a knob inset by half the gap it leaves. Deriving the
+	   knob from the track height means the off position and the on position
+	   are the same expression with a sign, so neither needs a magic number
+	   per theme, and the knob lands flush at both ends. */
+	--track-w: 2.25rem;
+	--track-h: 1.25rem;
+	--knob-d: calc(var(--track-h) - 0.25rem);
+	--knob-inset: 0.1875rem;
+
+	/* ---- scrollbar (dark default) ------------------------------
+	   width:thin + always-visible gutter so short pages reserve the same
+	   12px a scrolling page uses. Without this the content box differs by
+	   12px between scrolling and non-scrolling pages and every
+	   navigation nudges the layout sideways. */
+	scrollbar-width: thin;
+	scrollbar-color: #3a3a3a #0a0a0a;
+}
+
+/* ================= dark — DEFAULT ================= */
+:root,
+:root[data-theme='dark'] {
+	color-scheme: dark;
+
+	/* palette — pure black-grey, zero chroma */
+	--bg: #0a0a0a;
+	--bg-2: #101010;
+	--bg-3: #161616;
+	--panel: #111111;
+	/* A surface NESTED inside a panel. It needed its own step: a tile
+	   inside a panel was painted `--bg-2` (#101010) on a `--panel`
+	   (#111111) - MEASURED contrast ratio 1.008, which is one 255th of
+	   a difference. The border was doing all the work and the fill did
+	   none, so three levels of enclosure on rpm's Dashboard all read as
+	   the same plane. In a dark UI a nested surface is RAISED, so it is
+	   LIGHTER than the panel that holds it. */
+	--panel-nested: #1a1a1a;
+		/* The step ABOVE --panel-nested: a control drawn ON a card (a chip, a
+	   segmented control, an inline edit) must be distinguishable from the
+	   card without competing with it. MEASURED on rpm at 390px: with a
+	   chip on --panel-nested, the control and its own container painted
+	   the identical fill and the control vanished into the card. One
+	   more step, and no more - a control is not a region. */
+	--surface-raised: #222222;
+	--line: #262626;
+	--line-soft: #1c1c1c;
+
+	--ink: #e8e8e8;
+	--ink-dim: #9c9c9c;
+	--ink-faint: #8b8b8b;
+
+	/* accent = neutral white-grey highlight (no color) */
+	--accent: #e8e8e8;
+	--accent-bright: #ffffff;
+	--accent-dim: #5c5c5c;
+	--accent-glow: rgba(255, 255, 255, 0.06);
+
+	/* secondary — muted greys, kept for component compat */
+	--cyan: #b3b3b3;
+	--green: #b3b3b3;
+
+	/* header / footer surfaces */
+	--header-bg: #0a0a0a;
+	--footer-bg: #080808;
+
+	/* shadow */
+	--shadow-1: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
+	--shadow-card: 0 20px 50px -24px rgba(0, 0, 0, 0.8);
+
+	/* scrim — the wash behind a modal dialog. A translucent black is the
+	   only dimmer that exists in a greyscale system, and it is the one
+	   colour that has to differ per theme: the same alpha over #0a0a0a
+	   and over #fafafa does not hide the page by the same amount. */
+	--scrim: rgba(0, 0, 0, 0.72);
+
+	/* selection */
+	--selection-bg: rgba(255, 255, 255, 0.14);
+	--selection-color: #ffffff;
+
+	/* terminal vignette */
+	--vignette: radial-gradient(120% 90% at 50% 0%, transparent 62%, rgba(0, 0, 0, 0.5));
+}
+
+/* ================= light — explicit opt-in ================= */
+:root[data-theme='light'] {
+	color-scheme: light;
+	--bg: #fafafa;
+	--bg-2: #ffffff;
+	--bg-3: #f0f0f0;
+	--panel: #f5f5f5;
+	/* The same logic inverts in a light UI: a nested surface is
+	   RECESSED, so it is darker than the panel that holds it. */
+	--panel-nested: #ececec;
+		/* The step ABOVE --panel-nested: a control drawn ON a card (a chip, a
+	   segmented control, an inline edit) must be distinguishable from the
+	   card without competing with it. MEASURED on rpm at 390px: with a
+	   chip on --panel-nested, the control and its own container painted
+	   the identical fill and the control vanished into the card. One
+	   more step, and no more - a control is not a region. */
+	--surface-raised: #f5f5f5;
+	--line: #d6d6d6;
+	--line-soft: #e2e2e2;
+
+	--ink: #111111;
+	--ink-dim: #4a4a4a;
+	--ink-faint: #6d6d6d;
+
+	--accent: #111111;
+	--accent-bright: #000000;
+	--accent-dim: #666666;
+	--accent-glow: rgba(0, 0, 0, 0.06);
+
+	--cyan: #333333;
+	--green: #333333;
+
+	--header-bg: #fafafa;
+	--footer-bg: #f0f0f0;
+
+	--shadow-1: 0 1px 0 rgba(0, 0, 0, 0.04) inset;
+	--shadow-card: 0 20px 50px -26px rgba(0, 0, 0, 0.18);
+
+	/* The scrim is a wash, not a shadow: it only has to separate the
+	   dialog from the page. 0.72 of black over a near-white page reads
+	   as a dark panel with a hole in it, so light needs its own value. */
+	--scrim: rgba(24, 24, 24, 0.42);
+
+	--selection-bg: rgba(0, 0, 0, 0.12);
+	--selection-color: #000000;
+
+	--vignette: radial-gradient(120% 90% at 50% 0%, transparent 62%, rgba(0, 0, 0, 0.06));
+
+	scrollbar-color: #b8b8b8 #f0f0f0;
+}
+
+/* ============================================================
+   Theming a NON-document root (a shadow root, an iframe, a
+   scoped container) — prefix any ancestor with [data-cm-theme]
+   and the token set applies to that subtree only:
+
+     <div data-cm-theme="light"> ... </div>
+
+   data-theme is reserved for the document element.
+   ============================================================ */
+[data-cm-theme='dark'],
+[data-cm-theme='dark'] {
+	color-scheme: dark;
+	--bg: #0a0a0a;
+	--bg-2: #101010;
+	--bg-3: #161616;
+	--panel: #111111;
+	/* A surface NESTED inside a panel. It needed its own step: a tile
+	   inside a panel was painted `--bg-2` (#101010) on a `--panel`
+	   (#111111) - MEASURED contrast ratio 1.008, which is one 255th of
+	   a difference. The border was doing all the work and the fill did
+	   none, so three levels of enclosure on rpm's Dashboard all read as
+	   the same plane. In a dark UI a nested surface is RAISED, so it is
+	   LIGHTER than the panel that holds it. */
+	--panel-nested: #1a1a1a;
+		/* The step ABOVE --panel-nested: a control drawn ON a card (a chip, a
+	   segmented control, an inline edit) must be distinguishable from the
+	   card without competing with it. MEASURED on rpm at 390px: with a
+	   chip on --panel-nested, the control and its own container painted
+	   the identical fill and the control vanished into the card. One
+	   more step, and no more - a control is not a region. */
+	--surface-raised: #222222;
+	--line: #262626;
+	--line-soft: #1c1c1c;
+	--ink: #e8e8e8;
+	--ink-dim: #9c9c9c;
+	--ink-faint: #8b8b8b;
+	--accent: #e8e8e8;
+	--accent-bright: #ffffff;
+	--accent-dim: #5c5c5c;
+	--accent-glow: rgba(255, 255, 255, 0.06);
+	--header-bg: #0a0a0a;
+	--footer-bg: #080808;
+	--shadow-1: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
+	--shadow-card: 0 20px 50px -24px rgba(0, 0, 0, 0.8);
+	--scrim: rgba(0, 0, 0, 0.72);
+	--selection-bg: rgba(255, 255, 255, 0.14);
+	--selection-color: #ffffff;
+	--vignette: radial-gradient(120% 90% at 50% 0%, transparent 62%, rgba(0, 0, 0, 0.5));
+	scrollbar-color: #3a3a3a #0a0a0a;
+}
+
+[data-cm-theme='light'],
+[data-cm-theme='light'] {
+	color-scheme: light;
+	--bg: #fafafa;
+	--bg-2: #ffffff;
+	--bg-3: #f0f0f0;
+	--panel: #f5f5f5;
+	/* The same logic inverts in a light UI: a nested surface is
+	   RECESSED, so it is darker than the panel that holds it. */
+	--panel-nested: #ececec;
+		/* The step ABOVE --panel-nested: a control drawn ON a card (a chip, a
+	   segmented control, an inline edit) must be distinguishable from the
+	   card without competing with it. MEASURED on rpm at 390px: with a
+	   chip on --panel-nested, the control and its own container painted
+	   the identical fill and the control vanished into the card. One
+	   more step, and no more - a control is not a region. */
+	--surface-raised: #f5f5f5;
+	--line: #d6d6d6;
+	--line-soft: #e2e2e2;
+	--ink: #111111;
+	--ink-dim: #4a4a4a;
+	--ink-faint: #6d6d6d;
+	--accent: #111111;
+	--accent-bright: #000000;
+	--accent-dim: #666666;
+	--accent-glow: rgba(0, 0, 0, 0.06);
+	--header-bg: #fafafa;
+	--footer-bg: #f0f0f0;
+	--shadow-1: 0 1px 0 rgba(0, 0, 0, 0.04) inset;
+	--shadow-card: 0 20px 50px -26px rgba(0, 0, 0, 0.18);
+	--scrim: rgba(24, 24, 24, 0.42);
+	--selection-bg: rgba(0, 0, 0, 0.12);
+	--selection-color: #000000;
+	--vignette: radial-gradient(120% 90% at 50% 0%, transparent 62%, rgba(0, 0, 0, 0.06));
+	scrollbar-color: #b8b8b8 #f0f0f0;
+}

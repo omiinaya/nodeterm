@@ -1,0 +1,596 @@
+/* ============================================================
+   cli-mono — base layer
+   Requires tokens.css to be loaded first.
+   Element defaults, reset, scrollbar, prose rhythm.
+   ============================================================ */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+	overflow-y: scroll;
+	/* `clip`, not `hidden`. An absolutely-positioned overlay that escapes
+	   its container (the tooltip is the case in this library: a 288px tip
+	   on a 79px button) widens the document and makes the whole page
+	   scroll sideways - measured 27px of sideways scroll at a 390px
+	   viewport. `overflow-x: hidden` would fix the scroll but silently
+	   breaks `position: sticky` for every descendant, because a hidden
+	   box becomes the scroll container for its sticky children and the
+	   header stops sticking. `clip` clips the overflow WITHOUT creating
+	   a scroll container, so sticky keeps working. Measured in WebKit at
+	   390/375/320 after this: 0 sideways scroll, header still sticky. */
+	overflow-x: clip;
+	scroll-behavior: smooth;
+}
+
+/* ============ themed scrollbar (mono) ============ */
+*::-webkit-scrollbar { width: 12px; height: 12px; }
+*::-webkit-scrollbar-track { background: var(--bg-3); }
+*::-webkit-scrollbar-thumb {
+	background: var(--accent-dim);
+	border-radius: 0;
+	border: 3px solid var(--bg-3);
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--ink-dim); }
+*::-webkit-scrollbar-corner { background: var(--bg-3); }
+
+body {
+	margin: 0;
+	background-color: var(--bg);
+	background-image: var(--vignette);
+	background-attachment: fixed;
+	color: var(--ink);
+	font-family: var(--font-body);
+	font-size: var(--text);
+	line-height: 1.7;
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+main,
+.cm-shell {
+	width: var(--maxw);
+	max-width: calc(100% - (2 * var(--gutter)));
+	margin: 0 auto;
+	/* no top padding: --head-top (on the head block) is the single
+	   source for vertical start position. Padding here too would double it
+	   and put the post page out of line with the rest.
+	   NO horizontal padding: the max-width already reserves the gutter,
+	   so padding it too put content at 40px while the header sat at 20px.
+	   Two left rails is a bug, not a design choice. */
+	padding: 0 0 6rem;
+}
+
+a {
+	color: var(--ink-dim);
+	text-decoration: none;
+	transition: color var(--cm-t) var(--cm-ease);
+}
+a:hover { color: var(--accent-bright); }
+
+/* headings */
+h1, h2, h3, h4, h5, h6 {
+	margin: 0 0 0.6em;
+	color: var(--ink);
+	font-weight: 700;
+	line-height: 1.25;
+	letter-spacing: -0.01em;
+}
+h1 { font-size: var(--head-h1); }
+h2 { font-size: var(--head-h2); margin-top: 2em; }
+h3 { font-size: var(--text-lg); margin-top: 1.6em; }
+
+p {
+	margin: 0 0 1.1em;
+	/* A 2-line lede at 390px orphaned its last word ("anywhere." alone on
+	   line 2). balance evens the lines; harmless when they already fit. */
+	text-wrap: balance;
+}
+
+/* Emphasis inside dim prose. A bare <strong> is the browser default, which
+   is colour-only: it renders dim text a shade brighter than its paragraph
+   and nothing else. In a system whose dim token is --ink-dim, that is a
+   ~1.6:1 nudge - unreadable as emphasis, and every consumer re-declared it
+   (oem-log did, in two separate pages, in two scoped blocks).
+
+   Weight is the cue that survives greyscale, and colour is the second one:
+   --ink against --ink-dim is the widest step the palette has, and it is the
+   SAME pair the row title uses against its description. An element default,
+   not a class, because a bare <strong> with no class on it is the case. */
+strong, b { color: var(--ink); font-weight: 700; }
+
+/* inline code */
+code {
+	font-family: var(--font-mono);
+	font-size: 0.9em;
+	background: var(--bg-3);
+	border: 1px solid var(--line);
+	border-radius: 0;
+	padding: 0.15em 0.4em;
+	color: var(--ink);
+}
+
+/* pre blocks */
+pre {
+	background: var(--bg-2);
+	border: 1px solid var(--line);
+	border-left: 2px solid var(--accent-dim);
+	border-radius: var(--radius-sm);
+	padding: 1.3em 1.5em;
+	overflow-x: auto;
+	/* Without these, a long line inside a flex/grid column widens the
+	   whole page instead of scrolling inside the block. Verified on a
+	   380px viewport. */
+	max-width: 100%;
+	min-width: 0;
+	margin: 0 0 1.4em;
+	/* Firefox needs the box contained for the scroll to engage */
+	overflow-wrap: break-word;
+}
+pre > code {
+	all: unset;
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+	line-height: 1.7;
+	color: var(--ink);
+	display: block;
+	min-width: 0;
+	max-width: 100%;
+}
+
+/* `all: unset` on pre > code drops the inherited font-size, so a
+   floor applied to the parent never reaches it. Inline `code` scales
+   with 0.9em of whatever contains it, which lands under 12px inside a
+   small label. Both are floored here, at the definition, so no media
+   query elsewhere can be outranked. */
+@media (max-width: 680px) {
+	pre > code { font-size: max(var(--min-font), 0.82rem); }
+	code { font-size: max(var(--min-font), 0.9em); }
+}
+
+/* blockquote */
+blockquote {
+	margin: 0 0 1.4em;
+	padding: 0.5em 0 0.5em 1.1em;
+	border-left: 2px solid var(--accent-dim);
+	background: var(--bg-2);
+	border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+	color: var(--ink-dim);
+	font-size: 1em;
+}
+
+/* ---------- lists ----------
+   `list-style-type` is DECLARED here, and the reason is a measurement
+   rather than tidiness: without it the bullets are inherited from the
+   user agent, and every CSS reset in existence erases that default.
+
+   MEASURED in WebKit at 390px, on this library's own base.css with a
+   Tailwind v3 preflight loaded ahead of it:
+
+       ul { list-style-type: disc }      (library alone)
+       ul { list-style-type: none }      (same sheet, + preflight)
+
+   The library was styling the INDENT and never the MARKER, so the one
+   thing that makes a list a list was the single most fragile property
+   in the sheet. A consumer adopting this on any reset-based stack -
+   Tailwind, Bootstrap, most CSS frameworks - loses every bullet in the
+   document while `padding-left` still reads 1.4em, so the paragraph
+   looks deliberate: a list-shaped indent with nothing in it. Measured
+   across hermes-articles' real corpus that is 1,772 bullet items and
+   818 numbered items in 35 articles.
+
+   The costs of declaring it are real and were checked:
+
+     - `ol` gets `decimal`, which is what it already renders, so the
+       numbered lists are unchanged.
+     - `.cm-rows`, `.cm-cards`, `.cm-stats`, `.cm-meters` and friends
+       are `list-style: none` at equal-or-higher specificity and are
+       untouched: this is (0,0,1) and they are (0,1,0).
+     - `li { margin-bottom }` and `li::marker` are unchanged.
+
+   `revert` is deliberately NOT used here. It resolves per-property
+   against the cascaded origin, so on a reset-based stack it hands the
+   bullet back to nothing; a declared value is what survives a reset. */
+ul, ol { padding-left: 1.4em; margin: 0 0 1.2em; list-style-type: disc; }
+ol { list-style-type: decimal; }
+
+/* The `.cm-prose` twin of the rule above, and the reason the two are not
+   the same declaration.
+
+   `ul, ol` is (0,0,1). Tailwind v3 preflight's `ol,ul,menu{list-style:none}`
+   is ALSO (0,0,1). Equal specificity means the winner is decided by SOURCE
+   ORDER, so the bare rule above survives only when the consumer's reset
+   loads FIRST. That is a real ordering on the page, not a hypothetical:
+   a Vite/PostCSS build inlines `@tailwind base` into the SAME stylesheet
+   as the consumer's own CSS, and where the vendored library file is
+   imported decides the result. MEASURED in WebKit at 390px, this rule
+   against a real preflight, both orderings:
+
+       preflight first   ul { list-style-type: disc }
+       preflight after   ul { list-style-type: none }     <-- the defect
+
+   Scoping to `.cm-prose ul` fixes the order and REGRESSES something else,
+   which is why it is not what shipped. `.cm-prose ul` is (0,1,1) and every
+   markerless list rule in this library is (0,1,0) - `.cm-rows` at 763,
+   `.cm-cards`, `.cm-projects`, `.cm-timeline`, `.cm-swatch`. MEASURED, a
+   `.cm-rows` nested inside a `.cm-prose` grows a bullet it must never have:
+
+       .cm-rows inside .cm-prose    none -> disc
+
+   So the discriminator is not a class at all, it is the ABSENCE of one.
+   `.cm-prose ul:not([class])` is (0,2,1): it beats preflight in either load
+   order, and it cannot match a list that carries a class, because a classed
+   list belongs to whoever gave it the class. Tailwind's own `.list-disc` and
+   `.list-none` keep working. This is the same doctrine the bare rules above
+   follow - the library owns the defaults for elements a markdown renderer
+   emits with no attributes at all, and leaves classed markup to its owner.
+
+   MEASURED, both load orders, all four subjects:
+
+       prose ul   disc        ol   decimal
+       .cm-rows   none        .list-none  none
+
+   `ol` needs its own rule to reach `decimal`: it is the later declaration
+   in the pair, so it wins on order among equally-specific selectors. */
+.cm-prose ul:not([class]),
+.cm-prose ol:not([class]) { list-style-type: disc; }
+.cm-prose ol:not([class]) { list-style-type: decimal; }
+li { margin-bottom: 0.4em; }
+li::marker { color: var(--ink-dim); }
+
+hr { border: none; border-top: 1px solid var(--line); margin: 2em 0; }
+
+img { max-width: 100%; height: auto; border-radius: var(--radius); }
+
+table {
+	width: 100%; border-collapse: collapse; margin: 0 0 1.4em; font-size: 0.9em;
+}
+th, td { padding: 0.6em 0.9em; border: 1px solid var(--line); text-align: left; }
+/* The header cell's weight is DECLARED, for the same reason the list
+   marker is: a UA default that any reset can erase, on the one element
+   whose entire job is to be distinguishable from the data beneath it.
+
+   MEASURED in WebKit at 390px, same page, preflight as the only
+   variable:
+
+       th { font-weight: 700 }   library alone
+       th { font-weight: 400 }   + Tailwind v3 preflight
+
+   The cell kept its background and its `--ink` colour, so the header
+   still LOOKED like a header - it just stopped being bold, and a
+   header row at 400 beside 400 body cells is a grid of uniform
+   rectangles. Both library tables carry their own weight
+   (`.cm-prose-table th` at 600, `.cm-table th` at 400 deliberately),
+   so this rule governs the BARE `<th>` - the one a markdown renderer,
+   an admin console or a hand-written page emits - which is exactly the
+   case that had no declaration to lose. */
+th { background: var(--bg-3); color: var(--ink); font-weight: 700; }
+
+::selection { background: var(--selection-bg); color: var(--selection-color); }
+
+/* ============ accessibility helpers ============ */
+.cm-sr-only {
+	border: 0; padding: 0; margin: 0; position: absolute !important;
+	height: 1px; width: 1px; overflow: hidden;
+	clip: rect(1px 1px 1px 1px); clip-path: inset(50%); white-space: nowrap;
+}
+
+/* Visible keyboard focus everywhere. The house style: a 1px dim
+   outline that brightens on interaction. Never remove it without
+   replacing it.
+
+   The width is a coarse-pointer override and nothing else. 1px is the
+   desktop house style and stays exactly as it was: at a desk, next to a
+   1px border, at reading distance, a dim outline that brightens is the
+   established idiom and changing it would be a design decision, not a
+   bug fix. On a phone the same 1px is 1px - the reader is holding the
+   device at arm's length, the ring sits outside a border of identical
+   weight, and there is no cursor to imply "something is focused here".
+   Measured in WebKit at 390px: the focused field painted `1px solid` at
+   offset 2, which reads as a second border rather than a ring - and on
+   the sign-in card that looked like an error state, not a focus state.
+
+   So: same colour, same idiom, more weight where the reading distance
+   demands it. */
+:focus-visible {
+	outline: 1px solid var(--accent-dim);
+	outline-offset: 2px;
+}
+@media (pointer: coarse) {
+	:focus-visible {
+		outline: 2px solid var(--accent-dim);
+		outline-offset: 2px;
+	}
+}
+a:focus-visible,
+button:focus-visible,
+[tabindex]:focus-visible { outline-color: var(--ink-dim); }
+
+@media (prefers-reduced-motion: reduce) {
+	html { scroll-behavior: auto; }
+	*, *::before, *::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+	}
+}
+
+/* ============ responsive baseline ============ */
+@media (max-width: 680px) {
+	/* padding stays 0 horizontally: max-width already reserves the
+	   gutter, and re-adding it here is what put content at 40px while
+	   the header sat at 20px. Only the bottom padding shrinks. */
+	main,
+	.cm-shell { padding: 0 0 4rem; }
+	/* The page title must stay clearly above a section h2 (23.2px).
+	   1.7rem rendered at 27.2px, too close to shout at the same volume. */
+	:root { --head-top: 2rem; --head-h1: 1.95rem; }
+	body { font-size: var(--text-sm); }
+	h1 { font-size: var(--head-h1); }
+	pre { padding: 1.1em 1.1em; font-size: var(--text-xs); }
+	.cm-prose { padding: 0; }
+}
+
+/* ============ form controls ============
+   Every text input on the fleet is a mono field on a panel surface with a
+   1px line, and all 59 files that use one re-declare exactly that. These
+   are ELEMENT defaults, not a component, so they live in the base layer:
+   a bare <input> with no class is already on-brand, and the touch
+   ergonomics below apply to it without opting in. */
+/* A bare <button> is a button ELEMENT default, exactly like the bare
+   <input> above, and for the same reason: the nav, tabs, chips, rows,
+   sort headers and toast dismissals are all bare buttons that only need
+   their own component class for looks.
+
+   Without this, WebKit paints its native button face - a #c0c0c0 silver
+   with a border and 2px of padding - on every one of them. The reset used
+   to arrive from Tailwind's preflight; a consumer that ships this library
+   WITHOUT preflight (which is all of them, since the library is plain
+   CSS) had no other source for it. Measured in WebKit at 1280px: every
+   `#cm-header-links` row computed `rgb(192,192,192)` on a `rgb(10,10,10)`
+   surface - 1.48:1 - because this rule did not exist.
+
+   `background: none` rather than a palette token: the button must be
+   transparent BY DEFAULT, and the components that want a face (cm-btn,
+   cm-chip, cm-row) paint their own. Any class selector outranks this
+   (0,0,1) rule, so nothing here can fight a component. */
+button {
+	-webkit-appearance: none;
+	appearance: none;
+	background: none;
+	color: inherit;
+	font: inherit;
+	text-align: inherit;
+	border: 0;
+	margin: 0;
+	padding: 0;
+	cursor: pointer;
+}
+/* `:not(.cm-inline__input)` is the important one: this rule is (0,6,1),
+   which BEATS every plain component class in the sheet. A bare
+   `.cm-inline__input--tight` is (0,1,0) and lost outright - measured
+   386px instead of 11ch in WebKit, at 1280px and at 390px. No amount
+   of doubling the class helps against (0,6,1), so the base rule
+   has to step aside for the one input the library itself sizes.
+   `:not()` adds specificity, it does not remove it, so this is a
+   matter of the subject, not the weight. */
+/* `.cm-search__input` is excluded here for the SAME reason
+   `.cm-inline__input` is, and the comment above says so: this block is
+   (0,6,1) and beats every plain class in the sheet. A search field is
+   one of the two inputs the library sizes itself. Measured in WebKit at
+   390px before the exclusion: padding-left computed to 11.2px instead of
+   the 39px the component declares, so the placeholder ran UNDER the
+   magnifier glyph by 16px. `:not()` adds specificity, it does not remove
+   it, so the subject has to step aside -- no amount of doubling the
+   component class helps. */
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not(.cm-search__input),
+textarea:not(.cm-search__input),
+select:not(.cm-search__input) {
+	font-family: var(--font-mono);
+	font-size: max(var(--min-font), 1rem);
+	color: var(--ink);
+	/* `background-color`, NOT the `background` SHORTHAND.
+	   The shorthand resets `background-image` to `none`, and the select
+	   arrow below IS a `background-image` (two linear-gradients). Written
+	   as a shorthand from up here the block silently ate the arrow: the
+	   arrow rule is lower in the cascade, so its `background-image` never
+	   survived.
+	   **MEASURED in WebKit at 390px and 1280px on the showcase, before
+	   this change: the select computed `appearance: none` and
+	   `background-image: none`.** The library had removed the native
+	   arrow and painted nothing in its place, so every select in every
+	   consumer was a plain text box. Enumerating `sheet.cssRules` proved
+	   the owner: the block above declared `background: var(--bg-2)` at
+	   (0,4,1) and the arrow rule was a bare `select` at (0,0,1), so
+	   source order could never have saved it. */
+	background-color: var(--bg-2);
+	border: 1px solid var(--line);
+	border-radius: var(--radius-sm);
+	padding: 0.55rem 0.7rem;
+	/* `width: 100%` is declared SEPARATELY, below, so a component that
+	   sizes its own input can outrank it. Inside this block it is (0,6,1)
+	   and beats every plain class in the sheet: a bare
+	   `.cm-inline__input--tight` is (0,1,0) and lost outright, measuring
+	   386px instead of 11ch in WebKit at 1280px and at 390px. Doubling the
+	   class does not help either - (0,2,0) still loses to (0,6,1). */
+	/* A 44px box on a real phone; without this the field is 36px and
+	   the OS zooms the page on focus (iOS zooms below 16px). */
+	min-height: var(--tap);
+	line-height: 1.5;
+}
+textarea { min-height: calc(var(--tap) * 2); resize: vertical; }
+/* The selector REPEATS the field block's own two exclusions, and that is the
+   whole reason it works. A bare `select` is (0,0,1) and the field block's
+   `select:not(.cm-search__input)` is (0,1,1) - so the arrow's padding-right
+   LOST, and `--space-7` of clearance never reached the box.
+   **MEASURED in WebKit at 390x844 after the fill was already fixed: the
+   arrow painted, and `padding-right` computed to 11.2px instead of 32px.**
+   The wedges occupy the last 17.6px of the border box, so the content box
+   (ending 11.2px in) sat INSIDE the second wedge - a long option ran under
+   the arrow. Matching the field block's selector ties its specificity at
+   (0,2,1) and this rule is later in the file, so source order settles it.
+   This is the same repair the library already documents for the width rule
+   below; it excludes those two classes for the same reason. */
+select:not(.cm-search__input):not(.cm-inline__input):not([multiple]) {
+	/* The native arrow is drawn for the platform, not for a mono UI, and
+	   it disappears against a dark surface. */
+	/* WebKit honours -webkit-appearance on form controls; bare `appearance`
+	   is an alias older WebKit ignores, so it would draw the native control. */
+	-webkit-appearance: none;
+	appearance: none;
+	background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+		linear-gradient(135deg, currentColor 50%, transparent 50%);
+	background-position: calc(100% - 1.1rem) 52%, calc(100% - 0.75rem) 52%;
+	background-size: 0.35rem 0.35rem, 0.35rem 0.35rem;
+	background-repeat: no-repeat;
+	padding-right: var(--space-7);
+}
+
+/* The full-width default, at the same weight as the rest of the element
+   defaults but as its OWN rule, so a component input can opt out by
+   carrying a class of its own. `width` in the block above is (0,6,1);
+   declared here and nowhere else, it applies to everything that has no
+   component class, which is exactly the intent. */
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not(.cm-inline__input):not(.cm-search__input),
+textarea:not(.cm-inline__input):not(.cm-search__input),
+select:not(.cm-inline__input):not(.cm-search__input) {
+	width: 100%;
+}
+
+input::placeholder,
+textarea::placeholder { color: var(--ink-faint); opacity: 1; }
+input:disabled,
+textarea:disabled,
+select:disabled {
+	opacity: 0.55;
+	cursor: not-allowed;
+}
+/* Invalid only once touched or submitted, so a pristine form is calm.
+   The palette is greyscale by design, so the state is carried by weight
+   and a doubled border rather than a red hue. NOTE: the base selector
+   above uses :not() three times, and :not() counts its argument, giving
+   it (0,3,1) — higher than a plain [aria-invalid] (0,1,1), which silently
+   lost the cascade. Match the specificity or this never applies. */
+input:not([type='checkbox']):not([type='radio']):not([type='range'])[aria-invalid='true'],
+textarea[aria-invalid='true'],
+select[aria-invalid='true'] {
+	border-color: var(--ink-dim);
+	border-width: 2px;
+}
+
+/* checkbox / radio: a square or circle, drawn rather than native.
+   The drawn box stays small on purpose (it is a mark, not a target);
+   the LABEL is the tap target, so the box is centred inside a 44px
+   hit area via a transparent border. Without an inherited font the
+   fallback is Arial, which is wrong for this design system. */
+input[type='checkbox'],
+input[type='radio'] {
+	/* -webkit-appearance is the property WebKit actually honours on a form
+	   control; the bare `appearance` alias is ignored by older WebKit, so
+	   the native widget painted OVER the drawn one on iOS Safari. */
+	-webkit-appearance: none;
+	appearance: none;
+	--cm-box: 1.05rem;
+	width: var(--cm-box);
+	height: var(--cm-box);
+	min-width: var(--cm-box);
+	/* The label row carries min-height:var(--tap) so the ROW is the tap
+	   target. Without these, that min-height stretches the box: measured
+	   16.8x44 (ratio 0.38, a clear oval) in real WebKit at 390px. The
+	   controls are square marks; the row is the target. */
+	min-height: 0;
+	align-self: center;
+	aspect-ratio: 1;
+	margin: 0;
+	flex: none;
+	font-family: var(--font-mono);
+	border: 1px solid var(--line);
+	background: var(--bg-2);
+	cursor: pointer;
+}
+input[type='checkbox'] { border-radius: 0; }
+/* Half the box in px, not 50%. WebKit resolves a percentage radius against
+   the border box, so a 1px border on a 16.8px control rounds the curve
+   unevenly and the circle paints as an OVAL on iOS Safari. A fixed px
+   radius has no percentage to mis-resolve. */
+input[type='radio'] { border-radius: calc(var(--cm-box) / 2); }
+/* The control's own edge is a UI boundary, not a decorative divider, so it
+   must clear 3:1 (WCAG 1.4.11). --line is 1.4:1 against bg-2, which made
+   the unchecked state effectively invisible. */
+input[type='checkbox'],
+input[type='radio'] { border-color: var(--ink-dim); }
+input[type='checkbox']:checked,
+input[type='radio']:checked { background: var(--ink-dim); border-color: var(--ink-dim); }
+/* The tick is a rotated pseudo-element, not two diagonal gradients: at a
+   17px box a 44-56% gradient band is ~2px, and combined with a 3px inset
+   shadow it left a dot instead of a tick. A rotated L has crisp edges and
+   needs no image, font or gradient. */
+input[type='checkbox']:checked,
+input[type='radio']:checked {
+	background: var(--ink-dim);
+	border-color: var(--ink-dim);
+}
+input[type='checkbox']:checked::after {
+	content: '';
+	position: absolute;
+	left: 50%;
+	top: 46%;
+	width: 0.32rem;
+	height: 0.6rem;
+	border: solid var(--bg-2);
+	border-width: 0 2px 2px 0;
+	transform: translate(-50%, -50%) rotate(42deg);
+}
+input[type='checkbox'] { position: relative; }
+/* A checked radio keeps a ring: a filled disc with an inner punch-out. */
+input[type='radio']:checked {
+	box-shadow: inset 0 0 0 3.5px var(--bg-2);
+}
+
+/* the label is the tap target, so a phone-sized hit area is the text row */
+label { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; }
+fieldset { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: var(--space-4); margin: 0; }
+legend { padding: 0 0.4rem; color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.12em; }
+
+/* ============ touch ergonomics ============
+   Phones get a coarse pointer, so every interactive element must clear
+   44px on its short axis (WCAG 2.5.5) and no text may render below
+   --min-font. This lives here, in the base layer, so a new component
+   inherits it automatically instead of remembering to opt in. */
+@media (pointer: coarse) {
+	a,
+	button,
+	summary,
+	label,
+	input,
+	textarea,
+	select,
+	[role='button'],
+	[role='tab'] {
+		min-height: var(--tap);
+	}
+
+	/* Text-ish controls keep the target but not a 44px box, or the
+	   header grows absurdly. Inline links inside prose are excluded
+	   because stretching every sentence would break the reading rhythm. */
+	.cm-header__link,
+	.cm-btn {
+		display: inline-flex;
+		align-items: center;
+		min-height: var(--tap);
+		padding-block: var(--space-1);
+	}
+	.cm-row,
+	.cm-list-more a,
+	.cm-footer a {
+		min-height: var(--tap);
+		display: flex;
+		align-items: center;
+	}
+}
+
+/* Coarse pointers do not hover, so reveal hover-only affordances on tap. */
+@media (hover: none) {
+	.cm-row:active,
+	.cm-term__body:active { background: var(--panel); }
+	.cm-btn--ghost { border-color: var(--line); }
+}

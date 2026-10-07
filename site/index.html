@@ -1,6 +1,11 @@
 <!doctype html>
 <html lang="en">
   <head>
+    <!-- The FOUC guard is the FIRST node in <head>, ahead of every
+         stylesheet and ahead of the charset: a light-theme visitor must
+         never see a dark flash. Vendored verbatim from oem-ui — never
+         hand-edit, re-run scripts/install.sh --flat instead. -->
+    <script src="cli-mono-theme-guard.js"></script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>nodeterm — your terminals on an infinite canvas</title>
@@ -13,7 +18,14 @@
     <meta property="og:image" content="https://nodeterm.dev/assets/hero.png" />
     <meta property="og:type" content="website" />
     <meta name="theme-color" content="#0a0a0a" />
+    <meta name="color-scheme" content="dark light" />
     <link rel="icon" href="assets/nodeterm.png" />
+    <!-- oem-ui, in the library's own order: tokens, base, components.
+         styles.css comes LAST on purpose — this page's layout rules are
+         its own and must win the ties they share with the base layer. -->
+    <link rel="stylesheet" href="cli-mono/tokens.css" />
+    <link rel="stylesheet" href="cli-mono/base.css" />
+    <link rel="stylesheet" href="cli-mono/components.css" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -27,6 +39,10 @@
       <nav class="nav-links">
         <a href="#features">Features</a>
         <a href="https://github.com/eneskirca/nodeterm/blob/main/README.md" target="_blank" rel="noopener">Docs</a>
+        <button class="cm-icon-btn" type="button" data-cm-theme-toggle
+          aria-label="Switch to light theme" title="Toggle theme">
+          <span data-cm-theme-icon aria-hidden="true">☀</span>
+        </button>
         <a class="star" href="https://github.com/eneskirca/nodeterm" target="_blank" rel="noopener" aria-label="Star on GitHub">
           <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg>
           <span>Star</span>
@@ -161,5 +177,8 @@
         }
       })()
     </script>
+    <!-- oem-ui runtime: theme toggle, header scroll state, tap floors.
+         Vendored verbatim; never hand-edit. -->
+    <script src="cli-mono.js"></script>
   </body>
 </html>

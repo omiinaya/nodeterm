@@ -2605,7 +2605,7 @@ button.cm-row:hover { background: var(--bg-2); }
 .cm-header {
 	position: sticky;
 	top: 0;
-	z-index: 100;
+	z-index: var(--z-header);
 	margin: 0;
 	padding: 0 var(--gutter);
 	background: var(--header-bg);
